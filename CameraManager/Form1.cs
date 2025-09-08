@@ -28,8 +28,8 @@ namespace CameraManager
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr LoadLibrary(string lpFileName);
 
-        // Dynamic camera count based on database
-        private int NumCameras => Math.Max(1, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam?.Count ?? 12);
+        // Dynamic camera count based on database (cap at 6 live cameras)
+        private int NumCameras => Math.Min(6, Math.Max(1, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam?.Count ?? 6));
 
         private readonly List<ProcessSupervisor> _supervisors = new List<ProcessSupervisor>();
         private readonly List<MemoryMappedFile> _mmfs = new List<MemoryMappedFile>();
@@ -70,19 +70,28 @@ namespace CameraManager
         private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
 
-        // Per-camera thresholds loaded from DB (key: STT)
-        private readonly Dictionary<int, (double flame, double smoke)> _thresholdsByStt = new Dictionary<int, (double flame, double smoke)>();
-        private readonly object _thresholdsLock = new object();
+        // Global thresholds (no per-camera DB dependency)
+        private const double DEFAULT_THR_FLAME = 0.20;
+        private const double DEFAULT_THR_SMOKE = 0.20;
 
         // Store frame for AI detection processing
         private readonly Dictionary<int, Bitmap> _latestFrames = new Dictionary<int, Bitmap>();
         private readonly object _frameStoreLock = new object();
+        // Track last received frame time for No-Signal overlay
+        private readonly Dictionary<int, DateTime> _lastFrameAt = new Dictionary<int, DateTime>();
+        private const int NO_SIGNAL_TIMEOUT_MS = 2000;
+        // Map UI index -> STT and restart control
+        private readonly List<int> _cameraSttByIndex = new List<int>();
+        private readonly Dictionary<int, DateTime> _lastRestartAt = new Dictionary<int, DateTime>();
+        private const int RESTART_STALL_MS = 7000;     // if no frame > 7s, consider stalled
+        private const int RESTART_COOLDOWN_MS = 10000; // min 10s between restarts per camera
 
         // Detection processing flags to prevent recursion
         private readonly HashSet<int> _processsingDetection = new HashSet<int>();
         private readonly object _detectionProcessLock = new object();
 
         // Detection throttling and concurrency
+        private const bool ENABLE_AI_DETECTION = false; // temporarily disabled per request
         private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(4); // limit concurrent requests
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
@@ -98,12 +107,17 @@ namespace CameraManager
 
         public Form1()
         {
-            ClassSystemConfig.Ins.m_ClsCommon.StartupLoadingForm();
-
             InitializeComponent();
+
+            // Skip runtime initialization while opening in Designer
+            if (IsInDesignMode()) return;
+
             // Enable keyboard events
             this.KeyPreview = true;
             this.WindowState = FormWindowState.Maximized;
+
+            // Show startup loading UI
+            ClassSystemConfig.Ins.m_ClsCommon.StartupLoadingForm();
 
             // Handle process exit events to ensure cleanup
             AppDomain.CurrentDomain.ProcessExit += CurrentDomain_ProcessExit;
@@ -117,17 +131,29 @@ namespace CameraManager
             InitializeDetectionSystem();
         }
 
+        private static bool IsInDesignMode()
+        {
+            try
+            {
+                if (LicenseManager.UsageMode == LicenseUsageMode.Designtime) return true;
+                var proc = System.Diagnostics.Process.GetCurrentProcess()?.ProcessName;
+                return string.Equals(proc, "devenv", StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(proc, "Blend", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
         #region Form Event Handlers
         private void Form1_Load(object sender, EventArgs e)
         {
             try
             {
+                if (IsInDesignMode()) return;
                 Console.WriteLine("\n=== CameraManager Form1_Load Started ===");
 
                 InitializeUI();
                 LoadCameraList();
-                // Load per-camera thresholds from database after camera list
-                LoadThresholdsByStt();
+                // Thresholds now use global defaults (no per-camera DB)
 
                 Console.WriteLine($"Camera Configuration: {NumCameras} cameras, {Row}x{Col} grid");
 
@@ -153,6 +179,7 @@ namespace CameraManager
                 for (int i = 0; i < NumCameras && i < _mmfs.Count && i < _pictureboxes.Count; i++)
                 {
                     UpdatePictureBox(i);
+                    UpdateNoSignalOverlay(i);
                 }
             }
             catch (Exception ex)
@@ -642,15 +669,22 @@ namespace CameraManager
                 // Do not assume camera count at startup; cameras load later.
                 EnsureCameraDetectionsSize(Math.Max(1, NumCameras));
 
-                _detectionTimer.Interval = DETECTION_TIMER_INTERVAL_MS;
-                _detectionTimer.Tick += DetectionTimer_Tick;
-                _detectionTimer.Start();
+                if (ENABLE_AI_DETECTION)
+                {
+                    _detectionTimer.Interval = DETECTION_TIMER_INTERVAL_MS;
+                    _detectionTimer.Tick += DetectionTimer_Tick;
+                    _detectionTimer.Start();
 
-                _detectionCleanupTimer.Interval = 100;
-                _detectionCleanupTimer.Tick += DetectionCleanupTimer_Tick;
-                _detectionCleanupTimer.Start();
+                    _detectionCleanupTimer.Interval = 100;
+                    _detectionCleanupTimer.Tick += DetectionCleanupTimer_Tick;
+                    _detectionCleanupTimer.Start();
 
-                FileLogger.Log("? AI Detection system initialized");
+                    FileLogger.Log("? AI Detection system initialized");
+                }
+                else
+                {
+                    FileLogger.Log("? AI Detection disabled (stream only)");
+                }
             }
             catch (Exception ex)
             {
@@ -807,9 +841,8 @@ namespace CameraManager
                     FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
                 }
 
-                // Apply per-camera thresholds by STT (cameraIndex + 1)
-                var (thrFlame, thrSmoke) = GetThresholdsForIndex(cameraIndex);
-                var filtered = FilterDetectionsByThreshold(detections, thrFlame, thrSmoke);
+                // Apply global thresholds
+                var filtered = FilterDetectionsByThreshold(detections, DEFAULT_THR_FLAME, DEFAULT_THR_SMOKE);
 
                 EnsureCameraDetectionsSize(cameraIndex + 1);
                 lock (_cameraDetections)
@@ -1374,7 +1407,8 @@ namespace CameraManager
         {
             try
             {
-                int cameraCount = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count;
+                // Limit live camera layout to at most 6
+                int cameraCount = Math.Min(6, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count);
 
                 if (cameraCount <= 4)
                 {
@@ -1469,13 +1503,15 @@ namespace CameraManager
                             pictureBox.BorderStyle = BorderStyle.FixedSingle;
 
                             var label = new Label();
-                            label.Text = $"CAM {indexCam + 1}\n(Press {indexCam + 1}, F{indexCam + 1}, Double-click for fullscreen)\n(ESC to exit fullscreen)";
+                            label.Name = "OverlayLabel";
+                            label.Text = $"CAM {indexCam + 1}";
                             label.ForeColor = Color.White;
                             label.BackColor = Color.Transparent;
                             label.Font = new Font("Arial", 9, FontStyle.Bold);
                             label.TextAlign = ContentAlignment.MiddleCenter;
                             label.Dock = DockStyle.Fill;
                             label.Anchor = AnchorStyles.None;
+                            label.Visible = false; // hidden until Start and signal check
 
                             pictureBox.Controls.Add(label);
 
@@ -1557,6 +1593,139 @@ namespace CameraManager
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, $"OnPictureBoxPaint - Camera {cameraIndex}");
+            }
+        }
+
+        private void UpdateNoSignalOverlay(int cameraIndex)
+        {
+            if (cameraIndex < 0 || cameraIndex >= _pictureboxes.Count) return;
+            var pb = _pictureboxes[cameraIndex];
+            if (pb == null || pb.IsDisposed) return;
+
+            DateTime lastAt;
+            lock (_frameStoreLock)
+            {
+                _lastFrameAt.TryGetValue(cameraIndex, out lastAt);
+            }
+
+            var now = DateTime.Now;
+            bool stale = (lastAt == default) || (now - lastAt).TotalMilliseconds > NO_SIGNAL_TIMEOUT_MS;
+
+            if (pb.Controls.Count > 0)
+            {
+                if (pb.Controls[0] is Label overlay)
+                {
+                    if (stale)
+                    {
+                        overlay.Text = $"CAM {cameraIndex + 1}\nNo Signal (reconnecting...)";
+                        overlay.Visible = true;
+                        TryRestartStalledCamera(cameraIndex, now, lastAt);
+                    }
+                    else
+                    {
+                        overlay.Visible = false;
+                    }
+                }
+            }
+        }
+
+        private void TryRestartStalledCamera(int cameraIndex, DateTime now, DateTime lastAt)
+        {
+            try
+            {
+                if (cameraIndex < 0 || cameraIndex >= _supervisors.Count) return;
+                // If we've seen a frame within RESTART_STALL_MS, don't restart
+                if (lastAt != default && (now - lastAt).TotalMilliseconds <= RESTART_STALL_MS) return;
+
+                // Cooldown between restarts
+                if (_lastRestartAt.TryGetValue(cameraIndex, out var lastRestart))
+                {
+                    if ((now - lastRestart).TotalMilliseconds < RESTART_COOLDOWN_MS) return;
+                }
+
+                RestartWorker(cameraIndex);
+                _lastRestartAt[cameraIndex] = now;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"TryRestartStalledCamera({cameraIndex})");
+            }
+        }
+
+        private void RestartWorker(int index)
+        {
+            try
+            {
+                if (index < 0) return;
+                if (index >= _supervisors.Count) return;
+
+                // Dispose old supervisor to stop the process
+                try { _supervisors[index]?.Dispose(); } catch { }
+
+                string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
+                if (!File.Exists(cameraWorkerPath))
+                {
+                    FileLogger.Log("RestartWorker: CameraWorker.exe not found");
+                    return;
+                }
+
+                // Resolve STT and latest RTSP from DB
+                int stt = index + 1;
+                string rtspUrl = GetRtspUrlForStt(stt) ?? (index < ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count ? ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam[index] : null);
+                if (string.IsNullOrWhiteSpace(rtspUrl))
+                {
+                    FileLogger.Log($"RestartWorker: Missing RTSP for camera index {index}, STT {stt}");
+                    return;
+                }
+
+                string mmfName = $"Cam_{index}_MMF";
+                string mutexName = $"Global\\Cam_{index}_Mutex";
+                string camNameArg = $"camera_{index + 1}";
+                string sttArg = stt.ToString();
+                string connArg = $"\"{ClassSystemConfig.Ins?.m_ClsCommon?.connectionString}\"";
+                string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName} {camNameArg} {sttArg} {connArg}";
+
+                var supervisor = new ProcessSupervisor(
+                    loggerFactory: NullLoggerFactory.Instance,
+                    processRunType: ProcessRunType.NonTerminating,
+                    processPath: cameraWorkerPath,
+                    arguments: arguments,
+                    workingDirectory: Environment.CurrentDirectory
+                );
+                _supervisors[index] = supervisor;
+                supervisor.Start();
+                FileLogger.Log($"Restarted worker for camera {index + 1} (STT={stt})");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"RestartWorker({index})");
+            }
+        }
+
+        private string GetRtspUrlForStt(int stt)
+        {
+            try
+            {
+                if (stt <= 0) return null;
+                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
+                if (string.IsNullOrWhiteSpace(connStr)) return null;
+
+                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
+                {
+                    conn.Open();
+                    string sql = "SELECT RTSP_URL FROM camera_list WHERE STT = @stt LIMIT 1";
+                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                    {
+                        cmd.Parameters.AddWithValue("@stt", stt);
+                        var obj = cmd.ExecuteScalar();
+                        return obj?.ToString()?.Trim();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"GetRtspUrlForStt({stt})");
+                return null;
             }
         }
 
@@ -2006,72 +2175,7 @@ namespace CameraManager
             return dst;
         }
 
-        // === Thresholds by STT ===
-        private void LoadThresholdsByStt()
-        {
-            try
-            {
-                string connStr = null;
-                try { connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString; } catch { connStr = null; }
-                if (string.IsNullOrWhiteSpace(connStr))
-                {
-                    FileLogger.Log("LoadThresholdsByStt: Missing connection string");
-                    return;
-                }
-
-                var temp = new Dictionary<int, (double flame, double smoke)>();
-                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
-                {
-                    conn.Open();
-                    string sql = "SELECT STT, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list";
-                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            int stt = 0;
-                            double flame = 0, smoke = 0;
-                            try { stt = Convert.ToInt32(reader["STT"]); } catch { stt = 0; }
-                            try { flame = Convert.ToDouble(reader["Flame_Sensitivity"]); } catch { flame = 0; }
-                            try { smoke = Convert.ToDouble(reader["Smoke_Sensitivity"]); } catch { smoke = 0; }
-                            if (stt > 0)
-                            {
-                                temp[stt] = (flame, smoke);
-                            }
-                        }
-                    }
-                }
-
-                lock (_thresholdsLock)
-                {
-                    _thresholdsByStt.Clear();
-                    foreach (var kv in temp) _thresholdsByStt[kv.Key] = kv.Value;
-                }
-
-                FileLogger.Log($"Loaded thresholds for {_thresholdsByStt.Count} cameras (by STT)");
-            }
-            catch (Exception ex)
-            {
-                FileLogger.LogException(ex, "LoadThresholdsByStt");
-            }
-        }
-
-        private (double flame, double smoke) GetThresholdsForIndex(int cameraIndex)
-        {
-            try
-            {
-                int stt = cameraIndex + 1; // mapping by STT
-                lock (_thresholdsLock)
-                {
-                    if (_thresholdsByStt.TryGetValue(stt, out var t))
-                    {
-                        return t;
-                    }
-                }
-            }
-            catch { }
-            return (0.0, 0.0);
-        }
+        // Per-camera threshold loading removed. Using global thresholds only.
 
         private static bool IsFireLabel(string label)
         {
@@ -2216,8 +2320,7 @@ namespace CameraManager
             {
                 Console.WriteLine("?? Reloading camera list from database...");
                 LoadCameraList();
-                // Reload thresholds as well when camera list changes
-                LoadThresholdsByStt();
+                // Thresholds are global; no per-camera reload needed
 
                 if (this.InvokeRequired)
                 {
@@ -2315,6 +2418,8 @@ namespace CameraManager
         {
             try
             {
+                _isShuttingDown = false; // allow display/update after a previous Stop
+                
                 string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
                 if (!File.Exists(cameraWorkerPath))
                 {
@@ -2329,8 +2434,15 @@ namespace CameraManager
                     LoadCameraList();
                 }
 
-                int actualCameraCount = ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count;
+                // Start at most 6 camera workers (limit live cameras)
+                int actualCameraCount = Math.Min(6, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count);
                 FileLogger.Log($"?? Starting {actualCameraCount} camera workers");
+
+                // Reset last-frame timestamps so No-Signal can be evaluated from Start
+                lock (_frameStoreLock)
+                {
+                    _lastFrameAt.Clear();
+                }
 
                 for (int i = 0; i < actualCameraCount; i++)
                 {
@@ -2351,7 +2463,10 @@ namespace CameraManager
 
                         _mutexes.Add(new Mutex(false, mutexName));
 
-                        string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName}";
+                        string camNameArg = $"camera_{i + 1}";
+                        string sttArg = (i + 1).ToString();
+                        string connArg = $"\"{ClassSystemConfig.Ins?.m_ClsCommon?.connectionString}\"";
+                        string arguments = $"\"{rtspUrl}\" {mmfName} {mutexName} {camNameArg} {sttArg} {connArg}";
                         var supervisor = new ProcessSupervisor(
                             loggerFactory: NullLoggerFactory.Instance,
                             processRunType: ProcessRunType.NonTerminating,
@@ -2394,7 +2509,8 @@ namespace CameraManager
                 var mmf = _mmfs[index];
                 var pictureBox = _pictureboxes[index];
 
-                if (mutex?.WaitOne(0) == true)
+                // Allow a tiny wait to reduce lost frames while writer holds the mutex
+                if (mutex?.WaitOne(5) == true)
                 {
                     try
                     {
@@ -2447,14 +2563,20 @@ namespace CameraManager
                                     {
                                         if (pictureBox.Controls.Count > 0)
                                         {
-                                            pictureBox.Controls[0].Visible = false;
+                                            pictureBox.Controls[0].Visible = false; // hide overlay
                                         }
 
                                         var oldImage = pictureBox.Image;
                                         pictureBox.Image = bmp;
                                         oldImage?.Dispose();
 
-                                        // 👉 Thêm đoạn này để DetectionTimer có dữ liệu
+                                        // Update last frame timestamp for No-Signal tracking
+                                        lock (_frameStoreLock)
+                                        {
+                                            _lastFrameAt[index] = DateTime.Now;
+                                        }
+
+                                        // 👉 Ensure DetectionTimer has data
                                         lock (_frameStoreLock)
                                         {
                                             if (_latestFrames.ContainsKey(index))

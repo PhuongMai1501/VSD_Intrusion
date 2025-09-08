@@ -5,6 +5,7 @@ public static class CameraWorkerLogger
 {
     private static readonly object _lock = new object();
     private static string _logFilePath;
+    private static string _prefix = string.Empty;
     
     static CameraWorkerLogger()
     {
@@ -26,7 +27,8 @@ public static class CameraWorkerLogger
     public static void Log(string message)
     {
         string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-        string logEntry = $"[{timestamp}] {message}";
+        string prefix = string.IsNullOrWhiteSpace(_prefix) ? string.Empty : _prefix + " ";
+        string logEntry = $"[{timestamp}] {prefix}{message}";
         
         // Write to console
         Console.WriteLine(logEntry);
@@ -38,7 +40,8 @@ public static class CameraWorkerLogger
     public static void LogError(string message)
     {
         string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-        string logEntry = $"[{timestamp}] ERROR: {message}";
+        string prefix = string.IsNullOrWhiteSpace(_prefix) ? string.Empty : _prefix + " ";
+        string logEntry = $"[{timestamp}] {prefix}ERROR: {message}";
         
         // Write to console
         Console.WriteLine(logEntry);
@@ -50,7 +53,8 @@ public static class CameraWorkerLogger
     public static void LogException(Exception ex, string context = "")
     {
         string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
-        string logEntry = $"[{timestamp}] EXCEPTION {context}: {ex.Message}\n" +
+        string prefix = string.IsNullOrWhiteSpace(_prefix) ? string.Empty : _prefix + " ";
+        string logEntry = $"[{timestamp}] {prefix}EXCEPTION {context}: {ex.Message}\n" +
                          $"                    Type: {ex.GetType().Name}\n" +
                          $"                    Stack: {ex.StackTrace}";
         
@@ -85,5 +89,10 @@ public static class CameraWorkerLogger
     public static string GetLogFilePath()
     {
         return _logFilePath;
+    }
+
+    public static void SetPrefix(string prefix)
+    {
+        _prefix = prefix ?? string.Empty;
     }
 }

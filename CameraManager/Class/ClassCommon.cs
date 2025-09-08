@@ -33,7 +33,7 @@ namespace CameraManager
         public int m_indexView { get; set; }
 
         //DATA BASE
-        public string connectionString = "Server=localhost;Database=test;Uid=root;Pwd=123456;";
+        public string connectionString = "Server=localhost;Database=action_recog;Uid=root;Pwd=123456;";
 
         public string m_SavePath { get; set; }
 

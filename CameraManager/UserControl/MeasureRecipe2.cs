@@ -752,28 +752,28 @@ namespace CameraManager
             int iSelected = dgviewCamera.CurrentRow.Index;
             m_indexCamera = iSelected;
             int STT = iSelected + 1;
-            if (iSelected >= 0)
-            {
-                if (connection.State != ConnectionState.Open)
-                {
-                    connection.Open();
-                }
-                string query = "SELECT FrameInterval, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list WHERE STT = @STT";
-                using (MySqlCommand cmd = new MySqlCommand(query, connection))
-                {
-                    cmd.Parameters.AddWithValue("@STT", STT);
+            //if (iSelected >= 0)
+            //{
+            //    if (connection.State != ConnectionState.Open)
+            //    {
+            //        connection.Open();
+            //    }
+            //    string query = "SELECT FrameInterval, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list WHERE STT = @STT";
+            //    using (MySqlCommand cmd = new MySqlCommand(query, connection))
+            //    {
+            //        cmd.Parameters.AddWithValue("@STT", STT);
 
-                    using (MySqlDataReader reader = cmd.ExecuteReader())
-                    {
-                        if (reader.Read())
-                        {
-                            numInterval.Value = reader.GetDecimal(0);
-                            numFlame_Sen.Value = reader.GetDecimal(1);
-                            numSmoke_Sen.Value = reader.GetDecimal(2);
-                        }
-                    }
-                }
-            }
+            //        using (MySqlDataReader reader = cmd.ExecuteReader())
+            //        {
+            //            if (reader.Read())
+            //            {
+            //                numInterval.Value = reader.GetDecimal(0);
+            //                numFlame_Sen.Value = reader.GetDecimal(1);
+            //                numSmoke_Sen.Value = reader.GetDecimal(2);
+            //            }
+            //        }
+            //    }
+            //}
         }
     }
 

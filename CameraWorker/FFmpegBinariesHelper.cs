@@ -20,6 +20,7 @@ namespace FFmpeg.AutoGen.Example
                     {
                         Console.WriteLine($"FFmpeg binaries found in: {ffmpegBinaryPath}");
                         ffmpeg.RootPath = ffmpegBinaryPath;
+                        Console.WriteLine($"ffmpeg.RootPath set to: {ffmpeg.RootPath}");
                         return;
                     }
                     current = Directory.GetParent(current)?.FullName;
@@ -27,10 +28,12 @@ namespace FFmpeg.AutoGen.Example
                 
                 // Fallback - try to use system PATH
                 ffmpeg.RootPath = Environment.CurrentDirectory;
+                Console.WriteLine($"FFmpeg binaries not found under FFmpeg/bin; using current directory: {ffmpeg.RootPath}");
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
                 ffmpeg.RootPath = "/usr/lib/x86_64-linux-gnu";
+                Console.WriteLine($"ffmpeg.RootPath set to: {ffmpeg.RootPath}");
             }
             else
             {

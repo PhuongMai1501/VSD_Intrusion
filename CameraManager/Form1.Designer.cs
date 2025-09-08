@@ -62,7 +62,6 @@
             // 
             // DisplayTimer
             // 
-            DisplayTimer.Enabled = true;
             DisplayTimer.Interval = 33;
             DisplayTimer.Tick += DisplayTimer_Tick;
             // 

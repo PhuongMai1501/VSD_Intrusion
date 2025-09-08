@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Threading;
 using FFmpeg.AutoGen;
@@ -23,7 +24,17 @@ public unsafe class Program
         string rtspUrl = args[0];
         string mmfName = args[1];
         string mutexName = args[2];
+        string cameraName = (args.Length >= 4 && !string.IsNullOrWhiteSpace(args[3])) ? args[3] : null;
+        int stt = 0;
+        if (args.Length >= 5) int.TryParse(args[4], out stt);
+        string connStr = (args.Length >= 6) ? args[5] : null;
+        if (string.IsNullOrWhiteSpace(cameraName))
+        {
+            // Derive simple name from mmfName if possible
+            cameraName = mmfName;
+        }
 
+        CameraWorkerLogger.SetPrefix(cameraName);
         CameraWorkerLogger.Log($"RTSP URL: {rtspUrl}");
         CameraWorkerLogger.Log($"MMF Name: {mmfName}");
         CameraWorkerLogger.Log($"Mutex Name: {mutexName}");
@@ -47,16 +58,41 @@ public unsafe class Program
             CameraWorkerLogger.Log("Registering FFmpeg binaries...");
             FFmpegBinariesHelper.RegisterFFmpegBinaries();
             CameraWorkerLogger.Log("✅ FFmpeg binaries registered");
+            try { ffmpeg.avformat_network_init(); } catch { }
 
-            // Start main processing loop
-            ProcessRTSPStream(rtspUrl, mmfName, mutexName);
+            // Auto-reconnect loop
+            int attempt = 0;
+            while (!_shouldExit)
+            {
+                try
+                {
+                    attempt++;
+                    // Reload RTSP from DB if info available
+                    string attemptRtsp = ResolveRtspUrl(rtspUrl, stt, connStr) ?? rtspUrl;
+                    if (!string.Equals(attemptRtsp, rtspUrl, StringComparison.Ordinal))
+                    {
+                        CameraWorkerLogger.Log($"Reloaded RTSP from DB (STT={stt})");
+                    }
+                    CameraWorkerLogger.Log($"Connect attempt #{attempt} -> {attemptRtsp}");
+                    // Start processing; returns on error or natural end
+                    ProcessRTSPStream(attemptRtsp, mmfName, mutexName);
+                }
+                catch (Exception ex)
+                {
+                    CameraWorkerLogger.LogException(ex, "Main/Loop");
+                }
+
+                if (_shouldExit) break;
+                CameraWorkerLogger.Log("⚠️ Stream ended or failed. Reconnecting in 5 seconds...");
+                Thread.Sleep(5000);
+            }
         }
         catch (Exception ex)
         {
             CameraWorkerLogger.LogException(ex, "Main");
             Environment.Exit(1);
         }
-        
+
         CameraWorkerLogger.Log("CameraWorker exiting normally");
     }
 
@@ -85,10 +121,11 @@ public unsafe class Program
             try
             {
                 ffmpeg.av_dict_set(&options, "rtsp_transport", "tcp", 0);
-                ffmpeg.av_dict_set(&options, "stimeout", "10000000", 0); // 10 second timeout
+                ffmpeg.av_dict_set(&options, "stimeout", "5000000", 0); // 5 second timeout
+                ffmpeg.av_dict_set(&options, "rw_timeout", "5000000", 0); // 5 second IO timeout
                 ffmpeg.av_dict_set(&options, "probesize", "1000000", 0);
                 ffmpeg.av_dict_set(&options, "analyzeduration", "1000000", 0);
-                ffmpeg.av_dict_set(&options, "max_delay", "500000", 0); // 0.5 seconds
+                ffmpeg.av_dict_set(&options, "max_delay", "250000", 0); // 0.25 seconds
                 ffmpeg.av_dict_set(&options, "fflags", "nobuffer", 0);
 
                 int openResult = ffmpeg.avformat_open_input(&pFormatContext, rtspUrl, null, &options);
@@ -398,6 +435,73 @@ public unsafe class Program
 
             CameraWorkerLogger.Log("✅ Resources cleaned up");
         }
+    }
+
+    private static string ResolveRtspUrl(string currentRtsp, int stt, string connStr)
+    {
+        try
+        {
+            if (stt <= 0 || string.IsNullOrWhiteSpace(connStr)) return currentRtsp;
+
+            // Try load MySql.Data dynamically
+            var asm = LoadAssemblySafe("MySql.Data")
+                      ?? LoadAssemblySafe(Path.Combine(Environment.CurrentDirectory, "MySql.Data.dll"));
+            if (asm == null)
+            {
+                CameraWorkerLogger.Log("MySql.Data not found; using last RTSP");
+                return currentRtsp;
+            }
+
+            var connType = asm.GetType("MySql.Data.MySqlClient.MySqlConnection");
+            var cmdType = asm.GetType("MySql.Data.MySqlClient.MySqlCommand");
+            if (connType == null || cmdType == null)
+            {
+                CameraWorkerLogger.Log("MySql types not found; using last RTSP");
+                return currentRtsp;
+            }
+
+            using var conn = (IDisposable)Activator.CreateInstance(connType, new object[] { connStr });
+            connType.GetMethod("Open")?.Invoke(conn, null);
+
+            string sql = $"SELECT RTSP_URL FROM camera_list WHERE STT = {stt} LIMIT 1";
+            using var cmd = (IDisposable)Activator.CreateInstance(cmdType, new object[] { sql, conn });
+            var execReader = cmdType.GetMethod("ExecuteReader", Type.EmptyTypes);
+            var reader = execReader?.Invoke(cmd, null);
+            if (reader == null) { connType.GetMethod("Close")?.Invoke(conn, null); return currentRtsp; }
+
+            var readerType = reader.GetType();
+            bool hasRow = (bool)(readerType.GetMethod("Read")?.Invoke(reader, null) ?? false);
+            string url = null;
+            if (hasRow)
+            {
+                url = (string)readerType.GetMethod("GetString", new Type[] { typeof(int) })?.Invoke(reader, new object[] { 0 });
+                url = url?.Trim();
+            }
+            readerType.GetMethod("Close")?.Invoke(reader, null);
+            connType.GetMethod("Close")?.Invoke(conn, null);
+
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                return url;
+            }
+            return currentRtsp;
+        }
+        catch (Exception ex)
+        {
+            CameraWorkerLogger.LogException(ex, "ResolveRtspUrl");
+            return currentRtsp;
+        }
+    }
+
+    private static System.Reflection.Assembly LoadAssemblySafe(string nameOrPath)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(nameOrPath)) return null;
+            if (File.Exists(nameOrPath)) return System.Reflection.Assembly.LoadFrom(nameOrPath);
+            return System.Reflection.Assembly.Load(nameOrPath);
+        }
+        catch { return null; }
     }
 
     private static void DrawBlueRectangleOverlay(AVFrame* pFrameRGB, int width, int height)
