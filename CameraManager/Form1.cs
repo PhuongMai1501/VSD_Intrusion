@@ -19,6 +19,7 @@ using Newtonsoft.Json;
 using MySql.Data.MySqlClient;
 using System.Threading;
 using System.IO;
+using CameraManager.Class;
 
 namespace CameraManager
 {
@@ -64,15 +65,19 @@ namespace CameraManager
         private DateTime lastCacheCleanup = DateTime.Now;
         private const int CACHE_CLEANUP_INTERVAL_MS = 30000;
         private const string API_URL = "http://127.0.0.1:8000/predict";
+        // Intrusion API mode (reference ProcessVideoTest flow)
+        private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
+        // Base URL; ActionRecognitionClient will append "/detect"
+        private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // update if needed
+        private readonly object _intrusionClientsLock = new object();
+        private readonly System.Collections.Generic.Dictionary<int, ActionRecognitionClient> _intrusionClientsByCam = new System.Collections.Generic.Dictionary<int, ActionRecognitionClient>();
 
         // Detection overlay
         private readonly List<List<Detection>> _cameraDetections = new List<List<Detection>>();
         private readonly System.Windows.Forms.Timer _detectionTimer = new System.Windows.Forms.Timer();
         private readonly System.Windows.Forms.Timer _detectionCleanupTimer = new System.Windows.Forms.Timer();
 
-        // Global thresholds (no per-camera DB dependency)
-        private const double DEFAULT_THR_FLAME = 0.20;
-        private const double DEFAULT_THR_SMOKE = 0.20;
+        // Draw all detections using model's confidence
 
         // Store frame for AI detection processing
         private readonly Dictionary<int, Bitmap> _latestFrames = new Dictionary<int, Bitmap>();
@@ -91,13 +96,22 @@ namespace CameraManager
         private readonly object _detectionProcessLock = new object();
 
         // Detection throttling and concurrency
-        private const bool ENABLE_AI_DETECTION = false; // temporarily disabled per request
+        private const bool ENABLE_AI_DETECTION = true; // enable AI detection for intrusion API
         private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(4); // limit concurrent requests
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
         private const int DETECTION_TIMER_INTERVAL_MS = 150; // drive scheduling loop cadence
+        private const int DETECTION_TTL_MS = 800; // thời gian giữ bbox/track_id tối đa nếu không có cập nhật mới
+        // Region overlay (from DB) per camera
+        private class RegionData
+        {
+            public List<PointF> Points { get; set; } = new List<PointF>(4);
+            public bool IsNormalized { get; set; } = true; // true if [0..1]
+        }
+        private readonly Dictionary<int, RegionData> _regionDataByCam = new Dictionary<int, RegionData>();
+        private readonly object _regionLock = new object();
         // Detection input config: use square input size from global config
-        private int DETECT_INPUT_SIZE => Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
+        private int DETECT_INPUT_SIZE => INTRUSION_API_MODE ? 640 : Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
 
         // MySQL Connection
@@ -362,6 +376,28 @@ namespace CameraManager
                 Console.WriteLine($"? Form1_KeyDown error: {ex.Message}");
             }
         }
+        private void btnAlarm_Click(object sender, EventArgs e)
+        {
+            ChangeButtonColorClick(sender);
+            if (ClassSystemConfig.Ins.m_FrmConfigMessage == null || ClassSystemConfig.Ins.m_FrmConfigMessage.IsDisposed)
+            {
+                ClassSystemConfig.Ins.m_FrmConfigMessage = new FormConfigMessage();
+            }
+            ClassSystemConfig.Ins.m_FrmConfigMessage.Show();
+            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
+                                                    "Clicked Config Message View",
+                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+        }
+
+        private void btnLogView_Click(object sender, EventArgs e)
+        {
+            ChangeButtonColorClick(sender);
+            ClassSystemConfig.Ins.m_FrmLogView.Show();
+            ClassSystemConfig.Ins.m_FrmLogView.ShowOnScreen();
+            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
+                                                    "Clicked Log View",
+                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+        }
 
         #endregion
 
@@ -601,6 +637,18 @@ namespace CameraManager
                 _detectionTimer?.Dispose();
                 _detectionCleanupTimer?.Stop();
                 _detectionCleanupTimer?.Dispose();
+                try
+                {
+                    lock (_intrusionClientsLock)
+                    {
+                        foreach (var kv in _intrusionClientsByCam)
+                        {
+                            try { kv.Value?.Dispose(); } catch { }
+                        }
+                        _intrusionClientsByCam.Clear();
+                    }
+                }
+                catch { }
 
                 lock (_cameraDetections)
                 {
@@ -660,7 +708,11 @@ namespace CameraManager
             public double y2 { get; set; }
             public double score { get; set; }
             public DateTime timestamp { get; set; } = DateTime.Now;
+            // Optional: track id when using intrusion API
+            public int? track_id { get; set; }
         }
+
+        // Intrusion API DTOs moved to CameraManager.Class (IntrusionDtos.cs)
 
         private void InitializeDetectionSystem()
         {
@@ -727,7 +779,7 @@ namespace CameraManager
                         var detections = _cameraDetections[cameraIndex];
                         int originalCount = detections.Count;
 
-                        detections.RemoveAll(d => (currentTime - d.timestamp).TotalMilliseconds > 2000);
+                        detections.RemoveAll(d => (currentTime - d.timestamp).TotalMilliseconds > DETECTION_TTL_MS);
 
                         if (detections.Count != originalCount)
                         {
@@ -808,32 +860,41 @@ namespace CameraManager
                 // Resize frame to reduce payload
                 using var resized = ResizeToSquare(frame, DETECT_INPUT_SIZE);
 
-                // Encode JPEG with quality and to base64
-                var jpegBytes = EncodeJpeg(resized, JPEG_QUALITY);
-                string base64Image = Convert.ToBase64String(jpegBytes);
-
-                var payload = new { image = base64Image };
-                var json = JsonConvert.SerializeObject(payload);
-                using var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                using var response = await httpClient.PostAsync(API_URL, content);
-                if (!response.IsSuccessStatusCode)
+                List<Detection> detections;
+                if (INTRUSION_API_MODE)
                 {
-                    return;
+                    detections = await DetectIntrusionAsync(cameraIndex, resized, frame.Width, frame.Height, DETECT_INPUT_SIZE) 
+                                 ?? new List<Detection>();
                 }
-
-                var result = await response.Content.ReadAsStringAsync();
-                var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
-
-                // Debug raw
-                if (detectionsRaw.Count > 0)
+                else
                 {
-                    var d = detectionsRaw[0];
-                    FileLogger.Log($"Detect RAW cam {cameraIndex + 1}: cnt={detectionsRaw.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
-                }
+                    // Encode JPEG with quality and to base64
+                    var jpegBytes = EncodeJpeg(resized, JPEG_QUALITY);
+                    string base64Image = Convert.ToBase64String(jpegBytes);
 
-                // Normalize detections to original frame coordinates [0..1]
-                var detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, frame.Width, frame.Height, DETECT_INPUT_SIZE);
+                    var payload = new { image = base64Image };
+                    var json = JsonConvert.SerializeObject(payload);
+                    using var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    using var response = await httpClient.PostAsync(API_URL, content);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        return;
+                    }
+
+                    var result = await response.Content.ReadAsStringAsync();
+                    var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
+
+                    // Debug raw
+                    if (detectionsRaw.Count > 0)
+                    {
+                        var d = detectionsRaw[0];
+                        FileLogger.Log($"Detect RAW cam {cameraIndex + 1}: cnt={detectionsRaw.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
+                    }
+
+                    // Normalize detections to original frame coordinates [0..1]
+                    detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, frame.Width, frame.Height, DETECT_INPUT_SIZE);
+                }
 
                 if (detections.Count > 0)
                 {
@@ -841,8 +902,8 @@ namespace CameraManager
                     FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
                 }
 
-                // Apply global thresholds
-                var filtered = FilterDetectionsByThreshold(detections, DEFAULT_THR_FLAME, DEFAULT_THR_SMOKE);
+                // Vẽ tất cả bbox ngay; giữ nguyên confidence của model
+                var filtered = detections ?? new List<Detection>();
 
                 EnsureCameraDetectionsSize(cameraIndex + 1);
                 lock (_cameraDetections)
@@ -856,20 +917,17 @@ namespace CameraManager
 
                 if (filtered.Count > 0)
                 {
-                    try { SaveDetectionImage(cameraIndex, frame, filtered); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
+                    // Tạm thời không lưu ảnh khi có detection
+                    // try { SaveDetectionImage(cameraIndex, frame, filtered); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
 
-                    // Gọi cảnh báo alarm nếu bật và có người nhận active
+                    // Gửi cảnh báo: dùng trực tiếp nhãn action đầu tiên (nếu có), bỏ phân loại FIRE/SMOKE
                     try
                     {
-                        var labels = filtered
-                            .Where(d => d != null && !string.IsNullOrWhiteSpace(d.label))
-                            .Select(d => d.label?.Trim() ?? "")
-                            .ToList();
-                        bool hasFire = labels.Any(l => l.Equals("fire", StringComparison.OrdinalIgnoreCase) || l.Equals("flame", StringComparison.OrdinalIgnoreCase) || l.Contains("fire", StringComparison.OrdinalIgnoreCase) || l.Contains("flame", StringComparison.OrdinalIgnoreCase));
-                        bool hasSmoke = labels.Any(l => l.Equals("smoke", StringComparison.OrdinalIgnoreCase) || l.Contains("smoke", StringComparison.OrdinalIgnoreCase));
-                        string eventText = hasFire ? "FIRE" : (hasSmoke ? "SMOKE" : "FIRE");
-
-                        _ = SendAlarmToActiveRecipientsAsync(eventText);
+                        string eventText = filtered.FirstOrDefault(d => d != null && !string.IsNullOrWhiteSpace(d.label))?.label?.Trim();
+                        if (!string.IsNullOrWhiteSpace(eventText))
+                        {
+                            _ = SendAlarmToActiveRecipientsAsync(eventText);
+                        }
                     }
                     catch (Exception exAlarm)
                     {
@@ -893,6 +951,84 @@ namespace CameraManager
             }
         }
 
+        private ActionRecognitionClient GetIntrusionClient(int cameraIndex)
+        {
+            lock (_intrusionClientsLock)
+            {
+                if (_intrusionClientsByCam.TryGetValue(cameraIndex, out var client) && client != null)
+                    return client;
+                // Map by STT (cameraIndex+1) to port: basePort + (stt-1)
+                // Example: base http://host:5000 => CAM1->5000, CAM2->5001 ... CAM6->5005
+                string baseUrl = INTRUSION_API_BASE_URL;
+                try
+                {
+                    var uri = new Uri(baseUrl);
+                    int basePort = uri.IsDefaultPort ? 5000 : uri.Port;
+                    int stt = cameraIndex + 1;
+                    int port = basePort + (stt - 1);
+                    var ub = new UriBuilder(uri.Scheme, uri.Host, port);
+                    baseUrl = ub.Uri.ToString().TrimEnd('/');
+                }
+                catch { /* fallback: use baseUrl as-is */ }
+
+                var newClient = new ActionRecognitionClient(baseUrl);
+                _intrusionClientsByCam[cameraIndex] = newClient;
+                return newClient;
+            }
+        }
+
+        private async Task<List<Detection>> DetectIntrusionAsync(int cameraIndex, Bitmap squareFrame, int origW, int origH, int squareSize)
+        {
+            try
+            {
+                var jpegBytes = EncodeJpeg(squareFrame, JPEG_QUALITY);
+                string base64Image = Convert.ToBase64String(jpegBytes);
+
+                // Use ActionRecognitionClient per camera to call intrusion API with sticky stream_id
+                var client = GetIntrusionClient(cameraIndex);
+                string streamId = $"cam_{cameraIndex + 1}";
+                MultiPersonDetectionResponse obj = await client.DetectAsync(base64Image, streamId);
+                if (obj == null)
+                {
+                    return new List<Detection>();
+                }
+
+                var list = new List<Detection>();
+                if (obj?.Persons != null && obj.Persons.Count > 0)
+                {
+                    foreach (var p in obj.Persons)
+                    {
+                        if (p?.Bbox == null) continue;
+                        double sx1 = p.Bbox.X1;
+                        double sy1 = p.Bbox.Y1;
+                        double sx2 = sx1 + p.Bbox.W;
+                        double sy2 = sy1 + p.Bbox.H;
+
+                        list.Add(new Detection
+                        {
+                            label = p.Action?.Action ?? string.Empty,
+                            score = p.Action?.Confidence ?? 0,
+                            x1 = sx1,
+                            y1 = sy1,
+                            x2 = sx2,
+                            y2 = sy2,
+                            track_id = p.TrackId,
+                            timestamp = DateTime.Now
+                        });
+                    }
+                }
+
+                // Normalize to original frame
+                var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
+                return normalized;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DetectIntrusionAsync");
+                return new List<Detection>();
+            }
+        }
+
         // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
         private async Task SendAlarmToActiveRecipientsAsync(string message)
         {
@@ -904,6 +1040,10 @@ namespace CameraManager
 
                 // 0: Telegram (theo form config)
                 if (ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage != 0) return;
+
+                // TẠM THỜI BỎ QUA TRUY XUẤT DB alarm_mes (bảng chưa tồn tại) — sẽ bật lại sau
+                FileLogger.Log("SendAlarmToActiveRecipientsAsync: Temporarily disabled DB access to alarm_mes");
+                return;
 
                 string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
@@ -1088,7 +1228,7 @@ namespace CameraManager
 
                 foreach (var detection in detections)
                 {
-                    if (detection.score < 0.3) continue;
+                    // Always draw; ignore score threshold
 
                     // Support both normalized [0,1] and absolute coordinates
                     // If any coordinate > 1, assume absolute pixels already
@@ -1113,12 +1253,20 @@ namespace CameraManager
                         graphics.DrawRectangle(pen, rect);
                     }
 
-                    string labelText = $"{detection.label} ({detection.score:F2})";
-                    using (var font = new Font("Arial", 11, FontStyle.Bold))
+                    // Chỉ hiển thị nhãn khi API trả về action (label không rỗng)
+                    if (!string.IsNullOrWhiteSpace(detection.label))
                     {
-                        using (var textBrush = new SolidBrush(Color.White))
+                        string labelText = $"{detection.label} ({detection.score:F2})";
+                        if (detection.track_id.HasValue)
                         {
-                            graphics.DrawString(labelText, font, textBrush, new PointF(left + 3, Math.Max(0, top - 18)));
+                            labelText = $"{detection.label} (ID: {detection.track_id.Value}) ({detection.score:F2})";
+                        }
+                        using (var font = new Font("Arial", 11, FontStyle.Bold))
+                        {
+                            using (var textBrush = new SolidBrush(Color.White))
+                            {
+                                graphics.DrawString(labelText, font, textBrush, new PointF(left + 3, Math.Max(0, top - 18)));
+                            }
                         }
                     }
                 }
@@ -1576,6 +1724,9 @@ namespace CameraManager
 
                 // PictureBox will draw its Image by itself. We only draw overlay.
 
+                // Always draw region overlay (from DB) if available
+                DrawRegionOverlayIfAvailable(e.Graphics, pictureBox, cameraIndex);
+
                 List<Detection> detections = null;
                 lock (_cameraDetections)
                 {
@@ -1587,12 +1738,238 @@ namespace CameraManager
 
                 if (detections?.Count > 0)
                 {
-                    DrawDetectionBoxes(e.Graphics, detections, pictureBox.Width, pictureBox.Height);
+                    DrawDetectionsWithRegion(e.Graphics, detections, pictureBox, cameraIndex);
                 }
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, $"OnPictureBoxPaint - Camera {cameraIndex}");
+            }
+        }
+
+        private void DrawRegionOverlayIfAvailable(Graphics g, PictureBox pb, int cameraIndex)
+        {
+            try
+            {
+                if (g == null || pb == null) return;
+
+                // Load region for this camera on first use
+                EnsureRegionLoaded(cameraIndex);
+
+                Point[] pts = GetMappedRegionPoints(cameraIndex, pb);
+                if (pts == null || pts.Length < 4) return;
+
+                using (var pen = new Pen(Color.Lime, 2))
+                using (var brush = new SolidBrush(Color.Lime))
+                {
+                    // lines 0-1, 1-2, 2-3, 3-0
+                    g.DrawLine(pen, pts[0], pts[1]);
+                    g.DrawLine(pen, pts[1], pts[2]);
+                    g.DrawLine(pen, pts[2], pts[3]);
+                    g.DrawLine(pen, pts[3], pts[0]);
+
+                    // small points
+                    const int r = 3;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        g.FillEllipse(brush, pts[i].X - r, pts[i].Y - r, r * 2, r * 2);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"DrawRegionOverlayIfAvailable cam={cameraIndex + 1}");
+            }
+        }
+
+        private Point[] GetMappedRegionPoints(int cameraIndex, PictureBox pb)
+        {
+            try
+            {
+                RegionData rd = null;
+                lock (_regionLock)
+                {
+                    _regionDataByCam.TryGetValue(cameraIndex, out rd);
+                }
+                if (rd == null || rd.Points == null || rd.Points.Count < 4 || pb == null) return null;
+
+                var pts = new Point[4];
+                if (rd.IsNormalized)
+                {
+                    for (int i = 0; i < 4; i++)
+                    {
+                        pts[i] = new Point(
+                            (int)Math.Round(rd.Points[i].X * pb.Width),
+                            (int)Math.Round(rd.Points[i].Y * pb.Height)
+                        );
+                    }
+                }
+                else
+                {
+                    if (pb.Image == null) return null;
+                    float sx = pb.Image.Width > 0 ? (float)pb.Width / pb.Image.Width : 1f;
+                    float sy = pb.Image.Height > 0 ? (float)pb.Height / pb.Image.Height : 1f;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        pts[i] = new Point(
+                            (int)Math.Round(rd.Points[i].X * sx),
+                            (int)Math.Round(rd.Points[i].Y * sy)
+                        );
+                    }
+                }
+                return pts;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"GetMappedRegionPoints cam={cameraIndex + 1}");
+                return null;
+            }
+        }
+
+        private static bool IsPointInPolygon(PointF point, Point[] polygon)
+        {
+            try
+            {
+                if (polygon == null || polygon.Length < 3) return false;
+                bool inside = false;
+                int j = polygon.Length - 1;
+                for (int i = 0; i < polygon.Length; i++)
+                {
+                    var pi = polygon[i];
+                    var pj = polygon[j];
+                    bool intersect = ((pi.Y > point.Y) != (pj.Y > point.Y)) &&
+                                     (point.X < (pj.X - pi.X) * (point.Y - pi.Y) / (float)(pj.Y - pi.Y) + pi.X);
+                    if (intersect) inside = !inside;
+                    j = i;
+                }
+                return inside;
+            }
+            catch { return false; }
+        }
+
+        private void DrawDetectionsWithRegion(Graphics graphics, List<Detection> detections, PictureBox pictureBox, int cameraIndex)
+        {
+            try
+            {
+                if (graphics == null || detections == null || pictureBox == null) return;
+                int imageWidth = pictureBox.Width;
+                int imageHeight = pictureBox.Height;
+                Point[] regionPts = GetMappedRegionPoints(cameraIndex, pictureBox);
+
+                foreach (var detection in detections)
+                {
+                    bool isNormalized = detection.x2 <= 1.5 && detection.y2 <= 1.5 && detection.x1 >= 0 && detection.y1 >= 0;
+
+                    int x1 = (int)((isNormalized ? detection.x1 : detection.x1 / Math.Max(1, imageWidth)) * imageWidth);
+                    int y1 = (int)((isNormalized ? detection.y1 : detection.y1 / Math.Max(1, imageHeight)) * imageHeight);
+                    int x2 = (int)((isNormalized ? detection.x2 : detection.x2 / Math.Max(1, imageWidth)) * imageWidth);
+                    int y2 = (int)((isNormalized ? detection.y2 : detection.y2 / Math.Max(1, imageHeight)) * imageHeight);
+
+                    int left = Math.Max(0, Math.Min(imageWidth - 1, Math.Min(x1, x2)));
+                    int top = Math.Max(0, Math.Min(imageHeight - 1, Math.Min(y1, y2)));
+                    int right = Math.Max(0, Math.Min(imageWidth - 1, Math.Max(x1, x2)));
+                    int bottom = Math.Max(0, Math.Min(imageHeight - 1, Math.Max(y1, y2)));
+                    int w = Math.Max(1, right - left);
+                    int h = Math.Max(1, bottom - top);
+
+                    bool insideRegion = false;
+                    if (regionPts != null && regionPts.Length >= 3)
+                    {
+                        float cx = left + w / 2f;
+                        float cy = top + h / 2f;
+                        insideRegion = IsPointInPolygon(new PointF(cx, cy), regionPts);
+                    }
+
+                    using (var pen = new Pen(insideRegion ? Color.Red : Color.Lime, 2))
+                    {
+                        Rectangle rect = new Rectangle(left, top, w, h);
+                        graphics.DrawRectangle(pen, rect);
+                    }
+
+                    if (insideRegion && !string.IsNullOrWhiteSpace(detection.label))
+                    {
+                        string labelText = detection.label;
+                        using (var font = new Font("Arial", 11, FontStyle.Bold))
+                        using (var textBrush = new SolidBrush(Color.Red))
+                        using (var backBrush = new SolidBrush(Color.FromArgb(80, Color.White)))
+                        {
+                            var size = graphics.MeasureString(labelText, font);
+                            var labelRect = new RectangleF(left, Math.Max(0, top - size.Height - 4), size.Width + 6, size.Height + 4);
+                            graphics.FillRectangle(backBrush, labelRect);
+                            graphics.DrawString(labelText, font, textBrush, labelRect.Location + new SizeF(3, 2));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "DrawDetectionsWithRegion");
+            }
+        }
+
+        private void EnsureRegionLoaded(int cameraIndex)
+        {
+            try
+            {
+                lock (_regionLock)
+                {
+                    if (_regionDataByCam.ContainsKey(cameraIndex)) return;
+                }
+
+                // STT is 1-based
+                int stt = cameraIndex + 1;
+                var points = new List<PointF>(4);
+                bool isNormalized = true;
+
+                try
+                {
+                    using (var conn = new MySql.Data.MySqlClient.MySqlConnection(ClassSystemConfig.Ins?.m_ClsCommon?.connectionString))
+                    {
+                        conn.Open();
+                        string sql = "SELECT x1, y1, x2, y2, x3, y3, x4, y4 FROM camera_list WHERE STT = @STT LIMIT 1";
+                        using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
+                        {
+                            cmd.Parameters.AddWithValue("@STT", stt);
+                            using (var reader = cmd.ExecuteReader())
+                            {
+                                if (reader.Read())
+                                {
+                                    double[] vals = new double[8];
+                                    string[] cols = new[] { "x1","y1","x2","y2","x3","y3","x4","y4" };
+                                    for (int i = 0; i < 8; i++)
+                                    {
+                                        int ord = reader.GetOrdinal(cols[i]);
+                                        vals[i] = reader.IsDBNull(ord) ? 0.0 : Convert.ToDouble(reader.GetValue(ord));
+                                    }
+
+                                    // Heuristic: treat as normalized if all are within [0,1.5]
+                                    isNormalized = vals.All(v => v >= 0 && v <= 1.5);
+                                    points.Add(new PointF((float)vals[0], (float)vals[1]));
+                                    points.Add(new PointF((float)vals[2], (float)vals[3]));
+                                    points.Add(new PointF((float)vals[4], (float)vals[5]));
+                                    points.Add(new PointF((float)vals[6], (float)vals[7]));
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    FileLogger.LogException(ex, $"EnsureRegionLoaded DB STT={stt}");
+                }
+
+                lock (_regionLock)
+                {
+                    _regionDataByCam[cameraIndex] = new RegionData
+                    {
+                        Points = points,
+                        IsNormalized = isNormalized
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"EnsureRegionLoaded cam={cameraIndex + 1}");
             }
         }
 
@@ -2175,44 +2552,7 @@ namespace CameraManager
             return dst;
         }
 
-        // Per-camera threshold loading removed. Using global thresholds only.
-
-        private static bool IsFireLabel(string label)
-        {
-            if (string.IsNullOrWhiteSpace(label)) return false;
-            var l = label.Trim();
-            return l.Equals("fire", StringComparison.OrdinalIgnoreCase)
-                   || l.Equals("flame", StringComparison.OrdinalIgnoreCase)
-                   || l.IndexOf("fire", StringComparison.OrdinalIgnoreCase) >= 0
-                   || l.IndexOf("flame", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private static bool IsSmokeLabel(string label)
-        {
-            if (string.IsNullOrWhiteSpace(label)) return false;
-            var l = label.Trim();
-            return l.Equals("smoke", StringComparison.OrdinalIgnoreCase)
-                   || l.IndexOf("smoke", StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private static List<Detection> FilterDetectionsByThreshold(List<Detection> detections, double thrFlame, double thrSmoke)
-        {
-            if (detections == null || detections.Count == 0) return new List<Detection>();
-            var list = new List<Detection>();
-            foreach (var d in detections)
-            {
-                if (d == null) continue;
-                if (IsFireLabel(d.label))
-                {
-                    if (d.score >= thrFlame) list.Add(d);
-                }
-                else if (IsSmokeLabel(d.label))
-                {
-                    if (d.score >= thrSmoke) list.Add(d);
-                }
-            }
-            return list;
-        }
+        // Threshold checks removed: draw all detections with fixed score.
 
         private void CleanupResources()
         {
@@ -2617,27 +2957,5 @@ namespace CameraManager
 
         #endregion
 
-        private void btnAlarm_Click(object sender, EventArgs e)
-        {
-            ChangeButtonColorClick(sender);
-            if (ClassSystemConfig.Ins.m_FrmConfigMessage == null || ClassSystemConfig.Ins.m_FrmConfigMessage.IsDisposed)
-            {
-                ClassSystemConfig.Ins.m_FrmConfigMessage = new FormConfigMessage();
-            }
-            ClassSystemConfig.Ins.m_FrmConfigMessage.Show();
-            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
-                                                    "Clicked Config Message View",
-                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-        }
-
-        private void btnLogView_Click(object sender, EventArgs e)
-        {
-            ChangeButtonColorClick(sender);
-            ClassSystemConfig.Ins.m_FrmLogView.Show();
-            ClassSystemConfig.Ins.m_FrmLogView.ShowOnScreen();
-            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.HANDLER_CLICKED,
-                                                    "Clicked Log View",
-                                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-        }
     }
 }
