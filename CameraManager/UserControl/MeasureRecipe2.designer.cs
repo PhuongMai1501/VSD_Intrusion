@@ -41,9 +41,9 @@
             panel1 = new Panel();
             groupBox1 = new GroupBox();
             btnApply = new Button();
-            numSmoke_Sen = new NumericUpDown();
+            num_y1 = new NumericUpDown();
             label3 = new Label();
-            numFlame_Sen = new NumericUpDown();
+            num_x1 = new NumericUpDown();
             label2 = new Label();
             numInterval = new NumericUpDown();
             label1 = new Label();
@@ -68,6 +68,20 @@
             toolStripLabel3 = new ToolStripLabel();
             toolStripRuntime = new ToolStripButton();
             mySqlDataAdapter1 = new MySql.Data.MySqlClient.MySqlDataAdapter();
+            btnClear = new Button();
+            btnDraw4Point = new Button();
+            num_y2 = new NumericUpDown();
+            label4 = new Label();
+            num_x2 = new NumericUpDown();
+            label5 = new Label();
+            numericUpDown3 = new NumericUpDown();
+            label6 = new Label();
+            num_x3 = new NumericUpDown();
+            label7 = new Label();
+            numericUpDown5 = new NumericUpDown();
+            label8 = new Label();
+            numericUpDown6 = new NumericUpDown();
+            label9 = new Label();
             panelPage1Setting.SuspendLayout();
             tableLayoutPanel2.SuspendLayout();
             panel3.SuspendLayout();
@@ -77,13 +91,19 @@
             tableLayoutPanel1.SuspendLayout();
             panel1.SuspendLayout();
             groupBox1.SuspendLayout();
-            ((System.ComponentModel.ISupportInitialize)numSmoke_Sen).BeginInit();
-            ((System.ComponentModel.ISupportInitialize)numFlame_Sen).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)num_y1).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)num_x1).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numInterval).BeginInit();
             panel2.SuspendLayout();
             panelMain.SuspendLayout();
             ((System.ComponentModel.ISupportInitialize)pictureBox1).BeginInit();
             toolStrip1.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)num_y2).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)num_x2).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown3).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)num_x3).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown5).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown6).BeginInit();
             SuspendLayout();
             // 
             // panelPage1Setting
@@ -233,17 +253,31 @@
             // 
             // groupBox1
             // 
+            groupBox1.Controls.Add(numericUpDown5);
+            groupBox1.Controls.Add(label8);
+            groupBox1.Controls.Add(numericUpDown6);
+            groupBox1.Controls.Add(label9);
+            groupBox1.Controls.Add(numericUpDown3);
+            groupBox1.Controls.Add(label6);
+            groupBox1.Controls.Add(num_x3);
+            groupBox1.Controls.Add(label7);
+            groupBox1.Controls.Add(num_y2);
+            groupBox1.Controls.Add(label4);
+            groupBox1.Controls.Add(num_x2);
+            groupBox1.Controls.Add(label5);
+            groupBox1.Controls.Add(btnDraw4Point);
+            groupBox1.Controls.Add(btnClear);
             groupBox1.Controls.Add(btnApply);
-            groupBox1.Controls.Add(numSmoke_Sen);
+            groupBox1.Controls.Add(num_y1);
             groupBox1.Controls.Add(label3);
-            groupBox1.Controls.Add(numFlame_Sen);
+            groupBox1.Controls.Add(num_x1);
             groupBox1.Controls.Add(label2);
             groupBox1.Controls.Add(numInterval);
             groupBox1.Controls.Add(label1);
             groupBox1.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
             groupBox1.Location = new Point(3, 3);
             groupBox1.Name = "groupBox1";
-            groupBox1.Size = new Size(288, 198);
+            groupBox1.Size = new Size(288, 436);
             groupBox1.TabIndex = 0;
             groupBox1.TabStop = false;
             groupBox1.Text = "Parametter";
@@ -252,58 +286,58 @@
             // 
             btnApply.BackColor = Color.Gainsboro;
             btnApply.FlatAppearance.BorderSize = 0;
-            btnApply.Location = new Point(6, 150);
+            btnApply.Location = new Point(0, 394);
             btnApply.Name = "btnApply";
-            btnApply.Size = new Size(276, 32);
+            btnApply.Size = new Size(288, 32);
             btnApply.TabIndex = 7;
             btnApply.Text = "Apply";
             btnApply.TextImageRelation = TextImageRelation.TextBeforeImage;
             btnApply.UseVisualStyleBackColor = false;
             btnApply.Click += btnApply_Click;
             // 
-            // numSmoke_Sen
+            // num_y1
             // 
-            numSmoke_Sen.DecimalPlaces = 2;
-            numSmoke_Sen.Increment = new decimal(new int[] { 1, 0, 0, 131072 });
-            numSmoke_Sen.Location = new Point(168, 101);
-            numSmoke_Sen.Maximum = new decimal(new int[] { 1, 0, 0, 0 });
-            numSmoke_Sen.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
-            numSmoke_Sen.Name = "numSmoke_Sen";
-            numSmoke_Sen.Size = new Size(114, 25);
-            numSmoke_Sen.TabIndex = 6;
-            numSmoke_Sen.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_y1.DecimalPlaces = 2;
+            num_y1.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_y1.Location = new Point(168, 101);
+            num_y1.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            num_y1.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_y1.Name = "num_y1";
+            num_y1.Size = new Size(114, 25);
+            num_y1.TabIndex = 6;
+            num_y1.Value = new decimal(new int[] { 1, 0, 0, 65536 });
             // 
             // label3
             // 
             label3.AutoSize = true;
             label3.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
-            label3.Location = new Point(6, 106);
+            label3.Location = new Point(6, 103);
             label3.Name = "label3";
-            label3.Size = new Size(120, 19);
+            label3.Size = new Size(27, 19);
             label3.TabIndex = 5;
-            label3.Text = "Smoke_sensitivity:";
+            label3.Text = "y1:";
             // 
-            // numFlame_Sen
+            // num_x1
             // 
-            numFlame_Sen.DecimalPlaces = 2;
-            numFlame_Sen.Increment = new decimal(new int[] { 1, 0, 0, 131072 });
-            numFlame_Sen.Location = new Point(168, 68);
-            numFlame_Sen.Maximum = new decimal(new int[] { 1, 0, 0, 0 });
-            numFlame_Sen.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
-            numFlame_Sen.Name = "numFlame_Sen";
-            numFlame_Sen.Size = new Size(114, 25);
-            numFlame_Sen.TabIndex = 4;
-            numFlame_Sen.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x1.DecimalPlaces = 2;
+            num_x1.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x1.Location = new Point(168, 68);
+            num_x1.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            num_x1.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x1.Name = "num_x1";
+            num_x1.Size = new Size(114, 25);
+            num_x1.TabIndex = 4;
+            num_x1.Value = new decimal(new int[] { 1, 0, 0, 65536 });
             // 
             // label2
             // 
             label2.AutoSize = true;
             label2.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
-            label2.Location = new Point(6, 73);
+            label2.Location = new Point(6, 70);
             label2.Name = "label2";
-            label2.Size = new Size(114, 19);
+            label2.Size = new Size(27, 19);
             label2.TabIndex = 3;
-            label2.Text = "Flame_sensitivity:";
+            label2.Text = "x1:";
             // 
             // numInterval
             // 
@@ -320,7 +354,7 @@
             // 
             label1.AutoSize = true;
             label1.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
-            label1.Location = new Point(6, 38);
+            label1.Location = new Point(6, 35);
             label1.Name = "label1";
             label1.Size = new Size(58, 19);
             label1.TabIndex = 1;
@@ -490,6 +524,163 @@
             mySqlDataAdapter1.SelectCommand = null;
             mySqlDataAdapter1.UpdateCommand = null;
             // 
+            // btnClear
+            // 
+            btnClear.BackColor = Color.Gainsboro;
+            btnClear.FlatAppearance.BorderSize = 0;
+            btnClear.Location = new Point(0, 356);
+            btnClear.Name = "btnClear";
+            btnClear.Size = new Size(142, 32);
+            btnClear.TabIndex = 8;
+            btnClear.Text = "Clear";
+            btnClear.TextImageRelation = TextImageRelation.TextBeforeImage;
+            btnClear.UseVisualStyleBackColor = false;
+            // 
+            // btnDraw4Point
+            // 
+            btnDraw4Point.BackColor = Color.Gainsboro;
+            btnDraw4Point.FlatAppearance.BorderSize = 0;
+            btnDraw4Point.Location = new Point(146, 356);
+            btnDraw4Point.Name = "btnDraw4Point";
+            btnDraw4Point.Size = new Size(142, 32);
+            btnDraw4Point.TabIndex = 9;
+            btnDraw4Point.Text = "Draw Bbox";
+            btnDraw4Point.TextImageRelation = TextImageRelation.TextBeforeImage;
+            btnDraw4Point.UseVisualStyleBackColor = false;
+            btnDraw4Point.Click += btnDraw4Point_Click;
+            // 
+            // num_y2
+            // 
+            num_y2.DecimalPlaces = 2;
+            num_y2.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_y2.Location = new Point(168, 165);
+            num_y2.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            num_y2.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_y2.Name = "num_y2";
+            num_y2.Size = new Size(114, 25);
+            num_y2.TabIndex = 13;
+            num_y2.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label4
+            // 
+            label4.AutoSize = true;
+            label4.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label4.Location = new Point(6, 167);
+            label4.Name = "label4";
+            label4.Size = new Size(27, 19);
+            label4.TabIndex = 12;
+            label4.Text = "y2:";
+            // 
+            // num_x2
+            // 
+            num_x2.DecimalPlaces = 2;
+            num_x2.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x2.Location = new Point(168, 132);
+            num_x2.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            num_x2.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x2.Name = "num_x2";
+            num_x2.Size = new Size(114, 25);
+            num_x2.TabIndex = 11;
+            num_x2.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label5
+            // 
+            label5.AutoSize = true;
+            label5.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label5.Location = new Point(6, 134);
+            label5.Name = "label5";
+            label5.Size = new Size(27, 19);
+            label5.TabIndex = 10;
+            label5.Text = "x2:";
+            // 
+            // numericUpDown3
+            // 
+            numericUpDown3.DecimalPlaces = 2;
+            numericUpDown3.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown3.Location = new Point(168, 229);
+            numericUpDown3.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            numericUpDown3.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown3.Name = "numericUpDown3";
+            numericUpDown3.Size = new Size(114, 25);
+            numericUpDown3.TabIndex = 17;
+            numericUpDown3.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label6
+            // 
+            label6.AutoSize = true;
+            label6.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label6.Location = new Point(6, 231);
+            label6.Name = "label6";
+            label6.Size = new Size(27, 19);
+            label6.TabIndex = 16;
+            label6.Text = "y3:";
+            // 
+            // num_x3
+            // 
+            num_x3.DecimalPlaces = 2;
+            num_x3.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x3.Location = new Point(168, 196);
+            num_x3.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            num_x3.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            num_x3.Name = "num_x3";
+            num_x3.Size = new Size(114, 25);
+            num_x3.TabIndex = 15;
+            num_x3.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label7
+            // 
+            label7.AutoSize = true;
+            label7.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label7.Location = new Point(6, 198);
+            label7.Name = "label7";
+            label7.Size = new Size(27, 19);
+            label7.TabIndex = 14;
+            label7.Text = "x3:";
+            // 
+            // numericUpDown5
+            // 
+            numericUpDown5.DecimalPlaces = 2;
+            numericUpDown5.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown5.Location = new Point(168, 293);
+            numericUpDown5.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            numericUpDown5.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown5.Name = "numericUpDown5";
+            numericUpDown5.Size = new Size(114, 25);
+            numericUpDown5.TabIndex = 21;
+            numericUpDown5.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label8
+            // 
+            label8.AutoSize = true;
+            label8.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label8.Location = new Point(6, 295);
+            label8.Name = "label8";
+            label8.Size = new Size(27, 19);
+            label8.TabIndex = 20;
+            label8.Text = "y4:";
+            // 
+            // numericUpDown6
+            // 
+            numericUpDown6.DecimalPlaces = 2;
+            numericUpDown6.Increment = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown6.Location = new Point(168, 260);
+            numericUpDown6.Maximum = new decimal(new int[] { 1000000, 0, 0, 0 });
+            numericUpDown6.Minimum = new decimal(new int[] { 1, 0, 0, 65536 });
+            numericUpDown6.Name = "numericUpDown6";
+            numericUpDown6.Size = new Size(114, 25);
+            numericUpDown6.TabIndex = 19;
+            numericUpDown6.Value = new decimal(new int[] { 1, 0, 0, 65536 });
+            // 
+            // label9
+            // 
+            label9.AutoSize = true;
+            label9.Font = new Font("Microsoft YaHei", 9.75F, FontStyle.Regular, GraphicsUnit.Point, 0);
+            label9.Location = new Point(6, 262);
+            label9.Name = "label9";
+            label9.Size = new Size(27, 19);
+            label9.TabIndex = 18;
+            label9.Text = "x4:";
+            // 
             // MeasureRecipe2
             // 
             AutoScaleDimensions = new SizeF(6F, 13F);
@@ -510,8 +701,8 @@
             panel1.ResumeLayout(false);
             groupBox1.ResumeLayout(false);
             groupBox1.PerformLayout();
-            ((System.ComponentModel.ISupportInitialize)numSmoke_Sen).EndInit();
-            ((System.ComponentModel.ISupportInitialize)numFlame_Sen).EndInit();
+            ((System.ComponentModel.ISupportInitialize)num_y1).EndInit();
+            ((System.ComponentModel.ISupportInitialize)num_x1).EndInit();
             ((System.ComponentModel.ISupportInitialize)numInterval).EndInit();
             panel2.ResumeLayout(false);
             panel2.PerformLayout();
@@ -519,6 +710,12 @@
             ((System.ComponentModel.ISupportInitialize)pictureBox1).EndInit();
             toolStrip1.ResumeLayout(false);
             toolStrip1.PerformLayout();
+            ((System.ComponentModel.ISupportInitialize)num_y2).EndInit();
+            ((System.ComponentModel.ISupportInitialize)num_x2).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown3).EndInit();
+            ((System.ComponentModel.ISupportInitialize)num_x3).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown5).EndInit();
+            ((System.ComponentModel.ISupportInitialize)numericUpDown6).EndInit();
             ResumeLayout(false);
 
         }
@@ -550,9 +747,9 @@
         private System.Windows.Forms.ToolStripSeparator toolStripSeparator8;
         private System.Windows.Forms.ToolStripLabel toolStripLabel3;
         private System.Windows.Forms.ToolStripButton toolStripRuntime;
-        private System.Windows.Forms.NumericUpDown numSmoke_Sen;
+        private System.Windows.Forms.NumericUpDown num_y1;
         private System.Windows.Forms.Label label3;
-        private System.Windows.Forms.NumericUpDown numFlame_Sen;
+        private System.Windows.Forms.NumericUpDown num_x1;
         private System.Windows.Forms.Label label2;
         private System.Windows.Forms.NumericUpDown numInterval;
         private System.Windows.Forms.Label label1;
@@ -572,5 +769,17 @@
         private System.Windows.Forms.Label label4;
         private System.Windows.Forms.Label label5;
         private PictureBox pictureBox1;
+        private Button btnDraw4Point;
+        private Button btnClear;
+        private NumericUpDown numericUpDown5;
+        private Label label8;
+        private NumericUpDown numericUpDown6;
+        private Label label9;
+        private NumericUpDown numericUpDown3;
+        private Label label6;
+        private NumericUpDown num_x3;
+        private Label label7;
+        private NumericUpDown num_y2;
+        private NumericUpDown num_x2;
     }
 }

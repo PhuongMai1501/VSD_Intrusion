@@ -37,11 +37,25 @@ namespace CameraManager
 
         private Form1 main;
 
+        #region Region Draw (PictureBox1)
+        private bool _isDrawingRegion = false;
+        private readonly List<PointF> _regionPointsNorm = new List<PointF>(4); // normalized [0..1]
+        #endregion
+
         #endregion
 
         public MeasureRecipe2()
         {
             InitializeComponent();
+            // Wire region drawing events
+            try
+            {
+                btnDraw4Point.Click += btnDraw4Point_Click;
+                btnClear.Click += btnClear_Click;
+                pictureBox1.MouseClick += pictureBox1_MouseClick;
+                pictureBox1.Paint += pictureBox1_Paint;
+            }
+            catch { }
         }
         public void InitPageSetup(Form1 obj, int index, string title = "")
         {
@@ -174,8 +188,8 @@ namespace CameraManager
                     var detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, original.Width, original.Height, detectSize);
 
                     // Thresholds
-                    double sParamFlame = Convert.ToDouble(numFlame_Sen.Value);
-                    double sParamSmoke = Convert.ToDouble(numSmoke_Sen.Value);
+                    double sParamFlame = Convert.ToDouble(num_x1.Value);
+                    double sParamSmoke = Convert.ToDouble(num_y1.Value);
 
                     // Draw filtered detections
                     using (var annotated = (Bitmap)original.Clone())
@@ -701,27 +715,33 @@ namespace CameraManager
 
         private void btnApply_Click(object sender, EventArgs e)
         {
-            string query = @"
-                UPDATE camera_list
-                SET FrameInterval = @Interval,
-                    Flame_Sensitivity = @Flame,
-                    Smoke_Sensitivity = @Smoke
-                WHERE STT = @STT";  // hoặc WHERE Name = @Name
             int stt = m_indexCamera + 1;
-            int interval = Convert.ToInt32(numInterval.Value);
-            double flame_sensitivity = Convert.ToDouble(numFlame_Sen.Value);
-            double smoke_sensitivity = Convert.ToDouble(numSmoke_Sen.Value);
-
-            UpdateParam(query, connection, interval, flame_sensitivity, smoke_sensitivity, stt);
-
-            // Cập nhật lại DataGridView
-            //UpdateDataGridView();
-
+            try
+            {
+                if (_regionPointsNorm.Count == 4)
+                {
+                    SaveRegionToDatabase(stt, _regionPointsNorm);
+                    MessageBox.Show("Đã lưu region (4 điểm) vào database.");
+                }
+                else
+                {
+                    var typed = GetRegionFromNumericControls();
+                    if (typed != null)
+                    {
+                        SaveRegionToDatabase(stt, typed);
+                        MessageBox.Show("Đã lưu region từ ô nhập liệu vào database.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Lỗi lưu region: {ex.Message}");
+            }
         }
 
         private void MeasureRecipe2_Load(object sender, EventArgs e)
         {
-
+            try { pictureBox1.SizeMode = PictureBoxSizeMode.Zoom; } catch { }
         }
 
         private void btnConfigScreen_Click(object sender, EventArgs e)
@@ -774,6 +794,225 @@ namespace CameraManager
             //        }
             //    }
             //}
+        }
+
+        // ==================== Region Drawing Handlers ====================
+        private void btnDraw4Point_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (pictureBox1?.Image == null)
+                {
+                    MessageBox.Show("Hãy mở ảnh vào pictureBox1 trước khi vẽ.");
+                    return;
+                }
+                _isDrawingRegion = true;
+                _regionPointsNorm.Clear();
+                pictureBox1.Cursor = Cursors.Cross;
+                pictureBox1.Invalidate();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Lỗi bật chế độ vẽ: {ex.Message}");
+            }
+        }
+
+        private void btnClear_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                _isDrawingRegion = false;
+                _regionPointsNorm.Clear();
+                pictureBox1.Cursor = Cursors.Default;
+                pictureBox1.Invalidate();
+            }
+            catch { }
+        }
+
+        private void pictureBox1_MouseClick(object sender, MouseEventArgs e)
+        {
+            try
+            {
+                if (!_isDrawingRegion || pictureBox1?.Image == null) return;
+                var p = MapMouseToImageNormalized(pictureBox1, e.Location);
+                if (p.HasValue)
+                {
+                    if (_regionPointsNorm.Count < 4)
+                    {
+                        _regionPointsNorm.Add(p.Value);
+                        pictureBox1.Invalidate();
+                        if (_regionPointsNorm.Count == 4)
+                        {
+                            _isDrawingRegion = false;
+                            pictureBox1.Cursor = Cursors.Default;
+                            SetNumericControlsFromRegion(_regionPointsNorm);
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void pictureBox1_Paint(object sender, PaintEventArgs e)
+        {
+            try
+            {
+                if (pictureBox1?.Image == null) return;
+                var pts = MapRegionToPictureBoxPoints(pictureBox1, _regionPointsNorm);
+                if (pts != null && pts.Length > 0)
+                {
+                    using (var pen = new Pen(Color.Lime, 2))
+                    using (var brush = new SolidBrush(Color.Lime))
+                    {
+                        for (int i = 0; i < pts.Length; i++)
+                        {
+                            e.Graphics.FillEllipse(brush, pts[i].X - 3, pts[i].Y - 3, 6, 6);
+                            if (i > 0)
+                                e.Graphics.DrawLine(pen, pts[i - 1], pts[i]);
+                        }
+                        if (pts.Length == 4)
+                            e.Graphics.DrawLine(pen, pts[3], pts[0]);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // ==================== Region Drawing helpers ====================
+        private static PointF? MapMouseToImageNormalized(PictureBox pb, Point m)
+        {
+            try
+            {
+                if (pb?.Image == null) return null;
+                var img = pb.Image;
+                float imageAspect = img.Width / (float)img.Height;
+                float boxAspect = pb.ClientSize.Width / (float)pb.ClientSize.Height;
+                float scale;
+                RectangleF dest;
+                if (imageAspect > boxAspect)
+                {
+                    scale = pb.ClientSize.Width / (float)img.Width;
+                    float displayHeight = img.Height * scale;
+                    float offsetY = (pb.ClientSize.Height - displayHeight) / 2f;
+                    dest = new RectangleF(0, offsetY, pb.ClientSize.Width, displayHeight);
+                }
+                else
+                {
+                    scale = pb.ClientSize.Height / (float)img.Height;
+                    float displayWidth = img.Width * scale;
+                    float offsetX = (pb.ClientSize.Width - displayWidth) / 2f;
+                    dest = new RectangleF(offsetX, 0, displayWidth, pb.ClientSize.Height);
+                }
+                if (!dest.Contains(m)) return null;
+                float ix = (m.X - dest.X) / scale;
+                float iy = (m.Y - dest.Y) / scale;
+                ix = Math.Max(0, Math.Min(img.Width - 1, ix));
+                iy = Math.Max(0, Math.Min(img.Height - 1, iy));
+                // Trả về toạ độ pixel của ảnh (KHÔNG chuẩn hoá)
+                return new PointF(ix, iy);
+            }
+            catch { return null; }
+        }
+
+        private static Point[] MapRegionToPictureBoxPoints(PictureBox pb, List<PointF> normPts)
+        {
+            try
+            {
+                if (pb?.Image == null || normPts == null || normPts.Count == 0) return Array.Empty<Point>();
+                var img = pb.Image;
+                float imageAspect = img.Width / (float)img.Height;
+                float boxAspect = pb.ClientSize.Width / (float)pb.ClientSize.Height;
+                float scale;
+                RectangleF dest;
+                if (imageAspect > boxAspect)
+                {
+                    scale = pb.ClientSize.Width / (float)img.Width;
+                    float displayHeight = img.Height * scale;
+                    float offsetY = (pb.ClientSize.Height - displayHeight) / 2f;
+                    dest = new RectangleF(0, offsetY, pb.ClientSize.Width, displayHeight);
+                }
+                else
+                {
+                    scale = pb.ClientSize.Height / (float)img.Height;
+                    float displayWidth = img.Width * scale;
+                    float offsetX = (pb.ClientSize.Width - displayWidth) / 2f;
+                    dest = new RectangleF(offsetX, 0, displayWidth, pb.ClientSize.Height);
+                }
+                var pts = new List<Point>(normPts.Count);
+                foreach (var p in normPts)
+                {
+                    // p là toạ độ pixel ảnh
+                    float ix = p.X;
+                    float iy = p.Y;
+                    int dx = (int)Math.Round(dest.X + ix * scale);
+                    int dy = (int)Math.Round(dest.Y + iy * scale);
+                    pts.Add(new Point(dx, dy));
+                }
+                return pts.ToArray();
+            }
+            catch { return Array.Empty<Point>(); }
+        }
+
+        private void SetNumericControlsFromRegion(List<PointF> normPts)
+        {
+            try
+            {
+                if (normPts == null || normPts.Count < 4) return;
+                num_x1.Value = (decimal)Math.Round(normPts[0].X, 2);
+                num_y1.Value = (decimal)Math.Round(normPts[0].Y, 2);
+                num_x2.Value = (decimal)Math.Round(normPts[1].X, 2);
+                num_y2.Value = (decimal)Math.Round(normPts[1].Y, 2);
+                num_x3.Value = (decimal)Math.Round(normPts[2].X, 2);
+                numericUpDown3.Value = (decimal)Math.Round(normPts[2].Y, 2); // y3
+                numericUpDown6.Value = (decimal)Math.Round(normPts[3].X, 2); // x4
+                numericUpDown5.Value = (decimal)Math.Round(normPts[3].Y, 2); // y4
+            }
+            catch { }
+        }
+
+        private List<PointF> GetRegionFromNumericControls()
+        {
+            try
+            {
+                var pts = new List<PointF>(4)
+                {
+                    new PointF((float)num_x1.Value, (float)num_y1.Value),
+                    new PointF((float)num_x2.Value, (float)num_y2.Value),
+                    new PointF((float)num_x3.Value, (float)numericUpDown3.Value),
+                    new PointF((float)numericUpDown6.Value, (float)numericUpDown5.Value)
+                };
+                return pts;
+            }
+            catch { return null; }
+        }
+
+        private void SaveRegionToDatabase(int stt, List<PointF> ptsNorm)
+        {
+            if (ptsNorm == null || ptsNorm.Count < 4) return;
+            using (var conn = new MySqlConnection(ClassSystemConfig.Ins?.m_ClsCommon?.connectionString))
+            {
+                conn.Open();
+                string sql = @"UPDATE camera_list SET 
+                                x1=@x1, y1=@y1,
+                                x2=@x2, y2=@y2,
+                                x3=@x3, y3=@y3,
+                                x4=@x4, y4=@y4
+                              WHERE STT=@STT";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@STT", stt);
+                    // Lưu THEO PIXEL ảnh (không chuẩn hoá)
+                    cmd.Parameters.AddWithValue("@x1", Math.Round(ptsNorm[0].X, 2));
+                    cmd.Parameters.AddWithValue("@y1", Math.Round(ptsNorm[0].Y, 2));
+                    cmd.Parameters.AddWithValue("@x2", Math.Round(ptsNorm[1].X, 2));
+                    cmd.Parameters.AddWithValue("@y2", Math.Round(ptsNorm[1].Y, 2));
+                    cmd.Parameters.AddWithValue("@x3", Math.Round(ptsNorm[2].X, 2));
+                    cmd.Parameters.AddWithValue("@y3", Math.Round(ptsNorm[2].Y, 2));
+                    cmd.Parameters.AddWithValue("@x4", Math.Round(ptsNorm[3].X, 2));
+                    cmd.Parameters.AddWithValue("@y4", Math.Round(ptsNorm[3].Y, 2));
+                    cmd.ExecuteNonQuery();
+                }
+            }
         }
     }
 
