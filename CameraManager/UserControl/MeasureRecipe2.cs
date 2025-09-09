@@ -772,28 +772,65 @@ namespace CameraManager
             int iSelected = dgviewCamera.CurrentRow.Index;
             m_indexCamera = iSelected;
             int STT = iSelected + 1;
-            //if (iSelected >= 0)
-            //{
-            //    if (connection.State != ConnectionState.Open)
-            //    {
-            //        connection.Open();
-            //    }
-            //    string query = "SELECT FrameInterval, Flame_Sensitivity, Smoke_Sensitivity FROM camera_list WHERE STT = @STT";
-            //    using (MySqlCommand cmd = new MySqlCommand(query, connection))
-            //    {
-            //        cmd.Parameters.AddWithValue("@STT", STT);
 
-            //        using (MySqlDataReader reader = cmd.ExecuteReader())
-            //        {
-            //            if (reader.Read())
-            //            {
-            //                numInterval.Value = reader.GetDecimal(0);
-            //                numFlame_Sen.Value = reader.GetDecimal(1);
-            //                numSmoke_Sen.Value = reader.GetDecimal(2);
-            //            }
-            //        }
-            //    }
-            //}
+            // Hiển thị region của camera được chọn
+            try
+            {
+                LoadRegionFromDbAndShow(STT);
+            }
+            catch (Exception ex)
+            {
+                try { toolStripStatus.Text = $"Load region error: {ex.Message}"; } catch { }
+            }
+        }
+
+        private void LoadRegionFromDbAndShow(int stt)
+        {
+            using (var conn = new MySqlConnection(ClassSystemConfig.Ins?.m_ClsCommon?.connectionString))
+            {
+                conn.Open();
+                string sql = "SELECT x1,y1,x2,y2,x3,y3,x4,y4 FROM camera_list WHERE STT=@STT LIMIT 1";
+                using (var cmd = new MySqlCommand(sql, conn))
+                {
+                    cmd.Parameters.AddWithValue("@STT", stt);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        if (reader.Read())
+                        {
+                            double[] vals = new double[8];
+                            string[] cols = new[] { "x1","y1","x2","y2","x3","y3","x4","y4" };
+                            for (int i = 0; i < 8; i++)
+                            {
+                                int ord = reader.GetOrdinal(cols[i]);
+                                vals[i] = reader.IsDBNull(ord) ? 0.0 : Convert.ToDouble(reader.GetValue(ord));
+                            }
+
+                            // Cập nhật controls (px)
+                            try
+                            {
+                                num_x1.Value = (decimal)Math.Round(vals[0], 2);
+                                num_y1.Value = (decimal)Math.Round(vals[1], 2);
+                                num_x2.Value = (decimal)Math.Round(vals[2], 2);
+                                num_y2.Value = (decimal)Math.Round(vals[3], 2);
+                                num_x3.Value = (decimal)Math.Round(vals[4], 2);
+                                numericUpDown3.Value = (decimal)Math.Round(vals[5], 2);
+                                numericUpDown6.Value = (decimal)Math.Round(vals[6], 2);
+                                numericUpDown5.Value = (decimal)Math.Round(vals[7], 2);
+                            }
+                            catch { }
+
+                            // Lưu vào overlay list (px)
+                            _regionPointsNorm.Clear();
+                            _regionPointsNorm.Add(new PointF((float)vals[0], (float)vals[1]));
+                            _regionPointsNorm.Add(new PointF((float)vals[2], (float)vals[3]));
+                            _regionPointsNorm.Add(new PointF((float)vals[4], (float)vals[5]));
+                            _regionPointsNorm.Add(new PointF((float)vals[6], (float)vals[7]));
+
+                            pictureBox1?.Invalidate();
+                        }
+                    }
+                }
+            }
         }
 
         // ==================== Region Drawing Handlers ====================
