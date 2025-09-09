@@ -82,6 +82,8 @@ namespace CameraManager
         // Store frame for AI detection processing
         private readonly Dictionary<int, Bitmap> _latestFrames = new Dictionary<int, Bitmap>();
         private readonly object _frameStoreLock = new object();
+        // Track monotonically increasing frame sequence per camera to drop stale detections
+        private readonly Dictionary<int, long> _frameSeqByCam = new Dictionary<int, long>();
         // Track last received frame time for No-Signal overlay
         private readonly Dictionary<int, DateTime> _lastFrameAt = new Dictionary<int, DateTime>();
         private const int NO_SIGNAL_TIMEOUT_MS = 2000;
@@ -97,11 +99,12 @@ namespace CameraManager
 
         // Detection throttling and concurrency
         private const bool ENABLE_AI_DETECTION = true; // enable AI detection for intrusion API
-        private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(4); // limit concurrent requests
+        private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(6); // allow up to 6 cameras concurrently
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
-        private const int DETECTION_TIMER_INTERVAL_MS = 150; // drive scheduling loop cadence
-        private const int DETECTION_TTL_MS = 800; // thời gian giữ bbox/track_id tối đa nếu không có cập nhật mới
+        private const int DETECTION_TIMER_INTERVAL_MS = 80; // tăng tần suất lập lịch để giảm trễ hiển thị
+        private const int DETECTION_TTL_MS = 300; // cân bằng: xóa nhanh nhưng đủ mượt
+        private const int DRAW_TTL_MS = 220; // chỉ vẽ bbox nếu còn mới trong 220ms để giảm nhấp nháy
         // Region overlay (from DB) per camera
         private class RegionData
         {
@@ -727,7 +730,7 @@ namespace CameraManager
                     _detectionTimer.Tick += DetectionTimer_Tick;
                     _detectionTimer.Start();
 
-                    _detectionCleanupTimer.Interval = 100;
+                    _detectionCleanupTimer.Interval = 60; // faster cleanup for 6-camera setup
                     _detectionCleanupTimer.Tick += DetectionCleanupTimer_Tick;
                     _detectionCleanupTimer.Start();
 
@@ -807,10 +810,12 @@ namespace CameraManager
                 for (int i = 0; i < maxIndex; i++)
                 {
                     Bitmap frame = null;
+                    long grabbedSeq = 0;
                     lock (_frameStoreLock)
                     {
                         if (!_latestFrames.ContainsKey(i)) continue;
                         frame = (Bitmap)_latestFrames[i].Clone();
+                        _frameSeqByCam.TryGetValue(i, out grabbedSeq);
                     }
 
                     bool shouldProcess = false;
@@ -829,11 +834,27 @@ namespace CameraManager
 
                     if (!shouldProcess)
                     {
+                        // Nếu không xử lý vòng này, kiểm tra và xoá nhanh bbox quá hạn để tránh bóng ma
+                        try
+                        {
+                            lock (_cameraDetections)
+                            {
+                                if (i < _cameraDetections.Count && _cameraDetections[i].Count > 0)
+                                {
+                                    _cameraDetections[i].RemoveAll(d => (now - d.timestamp).TotalMilliseconds > DETECTION_TTL_MS);
+                                    if (_cameraDetections[i].Count == 0)
+                                    {
+                                        TriggerPaintEvent(i, 0);
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
                         frame.Dispose();
                         continue;
                     }
 
-                    _ = ProcessDetectionAsync(i, frame);
+                    _ = ProcessDetectionAsync(i, frame, grabbedSeq);
                 }
             }
             catch (Exception ex)
@@ -842,7 +863,7 @@ namespace CameraManager
             }
         }
 
-        private async Task ProcessDetectionAsync(int cameraIndex, Bitmap frame)
+        private async Task ProcessDetectionAsync(int cameraIndex, Bitmap frame, long frameSeq)
         {
             try
             {
@@ -902,6 +923,23 @@ namespace CameraManager
                     FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
                 }
 
+                // Bỏ kết quả nếu đã có frame mới hơn (tránh áp overlay cũ trở lại)
+                bool staleResult = false;
+                lock (_frameStoreLock)
+                {
+                    if (_frameSeqByCam.TryGetValue(cameraIndex, out var latestSeq))
+                    {
+                        if (latestSeq != frameSeq)
+                        {
+                            staleResult = true;
+                        }
+                    }
+                }
+                if (staleResult)
+                {
+                    return;
+                }
+
                 // Vẽ tất cả bbox ngay; giữ nguyên confidence của model
                 var filtered = detections ?? new List<Detection>();
 
@@ -914,6 +952,16 @@ namespace CameraManager
                         _cameraDetections[cameraIndex].AddRange(filtered);
                     }
                 }
+
+                // Cập nhật thời gian nhận detection gần nhất
+                try
+                {
+                    lock (_cameraDetections)
+                    {
+                        // no separate dict needed; timestamps are on items
+                    }
+                }
+                catch { }
 
                 if (filtered.Count > 0)
                 {
@@ -1020,13 +1068,59 @@ namespace CameraManager
 
                 // Normalize to original frame
                 var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
-                return normalized;
+                // Smooth with previous to reduce flicker
+                var smoothed = SmoothWithPrevious(cameraIndex, normalized);
+                return smoothed;
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "DetectIntrusionAsync");
                 return new List<Detection>();
             }
+        }
+
+        private List<Detection> SmoothWithPrevious(int cameraIndex, List<Detection> current)
+        {
+            try
+            {
+                if (current == null || current.Count == 0) return current ?? new List<Detection>();
+                EnsureCameraDetectionsSize(cameraIndex + 1);
+                List<Detection> prev = null;
+                lock (_cameraDetections)
+                {
+                    if (cameraIndex < _cameraDetections.Count)
+                        prev = new List<Detection>(_cameraDetections[cameraIndex]);
+                }
+                if (prev == null || prev.Count == 0) return current;
+
+                // Index prev by track_id (only smooth when available)
+                var mapPrev = new Dictionary<int, Detection>();
+                foreach (var d in prev)
+                {
+                    if (d?.track_id != null)
+                    {
+                        mapPrev[d.track_id.Value] = d;
+                    }
+                }
+                if (mapPrev.Count == 0) return current;
+
+                const double alpha = 0.6; // weight for current
+                foreach (var d in current)
+                {
+                    if (d?.track_id == null) continue;
+                    if (mapPrev.TryGetValue(d.track_id.Value, out var p))
+                    {
+                        d.x1 = alpha * d.x1 + (1 - alpha) * p.x1;
+                        d.y1 = alpha * d.y1 + (1 - alpha) * p.y1;
+                        d.x2 = alpha * d.x2 + (1 - alpha) * p.x2;
+                        d.y2 = alpha * d.y2 + (1 - alpha) * p.y2;
+                        // keep latest timestamp to avoid early drop
+                        d.timestamp = DateTime.Now;
+                    }
+                }
+                return current;
+            }
+            catch { return current ?? new List<Detection>(); }
         }
 
         // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
@@ -1856,8 +1950,12 @@ namespace CameraManager
                 int imageHeight = pictureBox.Height;
                 Point[] regionPts = GetMappedRegionPoints(cameraIndex, pictureBox);
 
+                var now = DateTime.Now;
                 foreach (var detection in detections)
                 {
+                    // Bỏ qua bbox quá cũ để tránh vẽ bóng ma
+                    if ((now - detection.timestamp).TotalMilliseconds > DRAW_TTL_MS) continue;
+
                     bool isNormalized = detection.x2 <= 1.5 && detection.y2 <= 1.5 && detection.x1 >= 0 && detection.y1 >= 0;
 
                     int x1 = (int)((isNormalized ? detection.x1 : detection.x1 / Math.Max(1, imageWidth)) * imageWidth);
@@ -2928,6 +3026,11 @@ namespace CameraManager
                                             {
                                                 _latestFrames.Add(index, (Bitmap)bmp.Clone());
                                             }
+                                            // tăng sequence mỗi khi nhận frame mới
+                                            if (_frameSeqByCam.TryGetValue(index, out var seq))
+                                                _frameSeqByCam[index] = seq + 1;
+                                            else
+                                                _frameSeqByCam[index] = 1;
                                         }
 
                                         pictureBox.Invalidate();

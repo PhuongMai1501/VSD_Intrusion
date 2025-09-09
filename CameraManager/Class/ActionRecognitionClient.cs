@@ -24,7 +24,7 @@ namespace CameraManager.Class
             };
             _client = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(2)
+                Timeout = TimeSpan.FromSeconds(1) // giảm timeout để tránh giữ bbox quá lâu khi API chậm
             };
             // Endpoint mục tiêu là /detect
             _apiUrl = $"{baseUrl.TrimEnd('/')}/detect";
