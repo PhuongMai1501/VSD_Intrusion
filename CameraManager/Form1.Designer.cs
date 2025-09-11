@@ -157,6 +157,7 @@
             label1.Size = new Size(40, 19);
             label1.TabIndex = 0;
             label1.Text = "Hello";
+            label1.Click += label1_Click;
             // 
             // panel2
             // 

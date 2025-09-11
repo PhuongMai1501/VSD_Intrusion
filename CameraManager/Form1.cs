@@ -100,6 +100,17 @@ namespace CameraManager
         // Detection throttling and concurrency
         private const bool ENABLE_AI_DETECTION = true; // enable AI detection for intrusion API
         private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(6); // allow up to 6 cameras concurrently
+        
+        // UI toggle state
+        // Toggle state and original layout widths for panelLog
+        private bool _isLogCollapsed = false;
+        private float _origCol0Width = 20f;
+        private float _origCol1Width = 80f;
+        
+        // Alarm throttling: avoid spamming alerts
+        private readonly object _alarmLock = new object();
+        private DateTime _lastAlarmSentAt = DateTime.MinValue;
+        private const int ALARM_MIN_INTERVAL_MS = 10000; // 10 seconds
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
         private const int DETECTION_TIMER_INTERVAL_MS = 80; // tăng tần suất lập lịch để giảm trễ hiển thị
@@ -126,6 +137,17 @@ namespace CameraManager
         {
             InitializeComponent();
 
+            // Capture original widths and wire label click to toggle log panel
+            try
+            {
+                if (tableLayoutPanel2?.ColumnStyles?.Count >= 2)
+                {
+                    _origCol0Width = (float)tableLayoutPanel2.ColumnStyles[0].Width;
+                    _origCol1Width = (float)tableLayoutPanel2.ColumnStyles[1].Width;
+                }
+            }
+            catch { }
+
             // Skip runtime initialization while opening in Designer
             if (IsInDesignMode()) return;
 
@@ -146,6 +168,62 @@ namespace CameraManager
 
             // Initialize detection components
             InitializeDetectionSystem();
+        }
+
+        private void label1_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (tableLayoutPanel2 == null || panelMain == null || panelLog == null) return;
+
+                tableLayoutPanel2.SuspendLayout();
+
+                if (!_isLogCollapsed)
+                {
+                    // Collapse log panel and let main span full width
+                    panelLog.Visible = false;
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = 0f;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = 100f;
+                    }
+                    try
+                    {
+                        tableLayoutPanel2.SetColumn(panelMain, 0);
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 2);
+                    }
+                    catch { }
+                    _isLogCollapsed = true;
+                }
+                else
+                {
+                    // Restore original layout
+                    try
+                    {
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 1);
+                        tableLayoutPanel2.SetColumn(panelMain, 1);
+                    }
+                    catch { }
+
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = _origCol0Width;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = _origCol1Width;
+                    }
+                    panelLog.Visible = true;
+                    _isLogCollapsed = false;
+                }
+
+                tableLayoutPanel2.ResumeLayout(true);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(label1_Click));
+            }
         }
 
         private static bool IsInDesignMode()
@@ -968,7 +1046,7 @@ namespace CameraManager
                     // Tạm thời không lưu ảnh khi có detection
                     // try { SaveDetectionImage(cameraIndex, frame, filtered); } catch (Exception exSave) { FileLogger.LogException(exSave, "ProcessDetectionAsync -> SaveDetectionImage"); }
 
-                    // Gửi cảnh báo: dùng trực tiếp nhãn action đầu tiên (nếu có), bỏ phân loại FIRE/SMOKE
+                    // Gửi cảnh báo: dùng trực tiếp nhãn action đầu tiên (nếu có)
                     try
                     {
                         string eventText = filtered.FirstOrDefault(d => d != null && !string.IsNullOrWhiteSpace(d.label))?.label?.Trim();
@@ -1132,12 +1210,29 @@ namespace CameraManager
                 // ByPass: nếu bật (1) thì bỏ qua không gửi
                 if (ClassSystemConfig.Ins?.m_ClsCommon?.b_ByPassAlarm == 1) return;
 
+                // Throttle: chỉ gửi tối đa 1 lần mỗi 10 giây
+                var now = DateTime.Now;
+                bool allowSend = false;
+                lock (_alarmLock)
+                {
+                    if (_lastAlarmSentAt == DateTime.MinValue || (now - _lastAlarmSentAt).TotalMilliseconds >= ALARM_MIN_INTERVAL_MS)
+                    {
+                        _lastAlarmSentAt = now;
+                        allowSend = true;
+                    }
+                }
+                if (!allowSend)
+                {
+                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: throttled (<=10s)");
+                    return;
+                }
+
                 // 0: Telegram (theo form config)
                 if (ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage != 0) return;
 
-                // TẠM THỜI BỎ QUA TRUY XUẤT DB alarm_mes (bảng chưa tồn tại) — sẽ bật lại sau
-                FileLogger.Log("SendAlarmToActiveRecipientsAsync: Temporarily disabled DB access to alarm_mes");
-                return;
+                //// TẠM THỜI BỎ QUA TRUY XUẤT DB alarm_mes (bảng chưa tồn tại) — sẽ bật lại sau
+                //FileLogger.Log("SendAlarmToActiveRecipientsAsync: Temporarily disabled DB access to alarm_mes");
+                //return;
 
                 string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
@@ -1744,6 +1839,14 @@ namespace CameraManager
                             pictureBox.BackColor = Color.Black;
                             pictureBox.BorderStyle = BorderStyle.FixedSingle;
 
+                            // Add context menu for saving image
+                            var cms = new ContextMenuStrip();
+                            var saveItem = new ToolStripMenuItem("Save Image");
+                            int capturedIndex = indexCam;
+                            saveItem.Click += (s, e) => SaveImageFromPictureBox(pictureBox, capturedIndex);
+                            cms.Items.Add(saveItem);
+                            pictureBox.ContextMenuStrip = cms;
+
                             var label = new Label();
                             label.Name = "OverlayLabel";
                             label.Text = $"CAM {indexCam + 1}";
@@ -1803,6 +1906,55 @@ namespace CameraManager
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "LayoutCameraSpreadView");
+            }
+        }
+
+        private void SaveImageFromPictureBox(PictureBox pb, int cameraIndex)
+        {
+            try
+            {
+                Bitmap? frame = null;
+                lock (_frameStoreLock)
+                {
+                    if (_latestFrames.TryGetValue(cameraIndex, out var latest) && latest != null)
+                    {
+                        frame = (Bitmap)latest.Clone(); // clone raw frame (no overlay)
+                    }
+                    else if (pb?.Image != null)
+                    {
+                        frame = new Bitmap(pb.Image); // fallback: clone current picture
+                    }
+                }
+
+                if (frame == null)
+                {
+                    MessageBox.Show("No image to save.", "Save Image", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                using (frame)
+                using (var sfd = new SaveFileDialog())
+                {
+                    sfd.Title = "Save Image";
+                    sfd.FileName = $"Camera_{cameraIndex + 1}_{DateTime.Now:yyyyMMdd_HHmmss}.png";
+                    sfd.Filter = "PNG Image|*.png|JPEG Image|*.jpg;*.jpeg|Bitmap Image|*.bmp";
+                    sfd.FilterIndex = 1;
+
+                    if (sfd.ShowDialog(this) == DialogResult.OK)
+                    {
+                        var ext = Path.GetExtension(sfd.FileName).ToLowerInvariant();
+                        ImageFormat format = ImageFormat.Png;
+                        if (ext == ".jpg" || ext == ".jpeg") format = ImageFormat.Jpeg;
+                        else if (ext == ".bmp") format = ImageFormat.Bmp;
+
+                        frame.Save(sfd.FileName, format);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, $"SaveImageFromPictureBox - Camera {cameraIndex + 1}");
+                MessageBox.Show($"Error saving image: {ex.Message}", "Save Image Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 

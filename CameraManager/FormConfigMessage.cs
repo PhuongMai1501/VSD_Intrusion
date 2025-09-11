@@ -187,6 +187,7 @@ namespace CameraManager
             }
             catch { }
         }
+
         #region Config Message
         private async void btnTest_Click(object sender, EventArgs e)
         {
@@ -353,7 +354,7 @@ namespace CameraManager
                 try
                 {
                     connectionMes.Open();
-                    string query = "SELECT ID, Name, SDT, IsActive, ChatID FROM alarm_mes ORDER BY ID DESC";
+                    string query = "SELECT STT, Name, SDT, IsActive, ChatID FROM alarm_mes ORDER BY STT DESC";
                     MySqlDataAdapter dataAdapter = new MySqlDataAdapter(query, connectionMes);
                     DataTable dataTable = new DataTable();
                     dataAdapter.Fill(dataTable);
@@ -363,9 +364,9 @@ namespace CameraManager
                     ClassSystemConfig.Ins.m_ClsFunc.FormatDataGridView(dgMessage_Alarm);
 
                     // Thiết lập tiêu đề và căn chỉnh cột
-                    dgMessage_Alarm.Columns["ID"].HeaderText = "STT";
-                    dgMessage_Alarm.Columns["ID"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
-                    dgMessage_Alarm.Columns["ID"].Width = 30;
+                    dgMessage_Alarm.Columns["STT"].HeaderText = "STT";
+                    dgMessage_Alarm.Columns["STT"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+                    dgMessage_Alarm.Columns["STT"].Width = 30;
 
                     dgMessage_Alarm.Columns["Name"].HeaderText = "Name";
                     dgMessage_Alarm.Columns["Name"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
@@ -400,11 +401,11 @@ namespace CameraManager
                 try
                 {
                     connectionMes.Open();
-                    string query = "DELETE FROM alarm_mes WHERE ID = @ID";
+                    string query = "DELETE FROM alarm_mes WHERE STT = @STT";
 
                     using (MySqlCommand cmd = new MySqlCommand(query, connectionMes))
                     {
-                        cmd.Parameters.AddWithValue("@ID", id);
+                        cmd.Parameters.AddWithValue("@STT", id);
 
                         int rowsAffected = cmd.ExecuteNonQuery();
                         if (rowsAffected > 0)
@@ -457,7 +458,7 @@ namespace CameraManager
             try
             {
                 connection.Open();
-                string query = "UPDATE alarm_mes SET Name = @Name, SDT = @SDT, IsActive = @IsActive, ChatID = @ChatID WHERE ID = @ID";
+                string query = "UPDATE alarm_mes SET Name = @Name, SDT = @SDT, IsActive = @IsActive, ChatID = @ChatID WHERE STT = @STT";
 
                 using (MySqlCommand command = new MySqlCommand(query, connection))
                 {
@@ -466,7 +467,7 @@ namespace CameraManager
                     command.Parameters.AddWithValue("@SDT", phone_number);
                     command.Parameters.AddWithValue("@IsActive", isActive ? 1 : 0);
                     command.Parameters.AddWithValue("@ChatID", string.IsNullOrEmpty(chatId) ? (object)DBNull.Value : chatId);
-                    command.Parameters.AddWithValue("@ID", stt);
+                    command.Parameters.AddWithValue("@STT", stt);
 
                     int rowsAffected = command.ExecuteNonQuery();
                     if (rowsAffected > 0)
@@ -553,7 +554,7 @@ namespace CameraManager
                 return;
             }
 
-            int id = Convert.ToInt32(dgMessage_Alarm.CurrentRow.Cells["ID"].Value);
+            int id = Convert.ToInt32(dgMessage_Alarm.CurrentRow.Cells["STT"].Value);
 
             DialogResult result = MessageBox.Show(
                 "Bạn có chắc chắn muốn xóa dòng này?",
