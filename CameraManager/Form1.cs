@@ -134,8 +134,8 @@ namespace CameraManager
         }
         private readonly object _trackLock = new object();
         private readonly Dictionary<int, Dictionary<int, TrackState>> _trackStates = new Dictionary<int, Dictionary<int, TrackState>>();
-        private const int TRACK_HANGOVER_MS = 500; // giữ bbox khi miss ngắn hạn
-        private const int TRACK_MAX_AGE_MS = 2000; // dọn track cũ lâu không thấy
+        private const int TRACK_HANGOVER_MS = 500; // giữ bbox tối đa ~0.5s khi miss ngắn hạn
+        private const int TRACK_MAX_AGE_MS = 1500; // dọn track cũ sau ~1.5s không thấy
         // Detection input config: use square input size from global config
         private int DETECT_INPUT_SIZE => INTRUSION_API_MODE ? 640 : Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
@@ -978,11 +978,7 @@ namespace CameraManager
                                  ?? new List<Detection>();
                 }
 
-                if (detections.Count > 0)
-                {
-                    var d = detections[0];
-                    FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={detections.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
-                }
+                // Logging for intrusion mode is handled inside DetectIntrusionAsync (only on real API results)
 
                 // Bỏ kết quả nếu đã có frame mới hơn (tránh áp overlay cũ trở lại)
                 bool staleResult = false;
@@ -1129,6 +1125,12 @@ namespace CameraManager
 
                 // Normalize to original frame coordinates [0..1]
                 var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
+                // Log only when API actually returns detections (avoid logging hangover tracks)
+                if (normalized != null && normalized.Count > 0)
+                {
+                    var d0 = normalized[0];
+                    FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={normalized.Count} first=({d0.label},{d0.score:F2}) x1={d0.x1:F3},y1={d0.y1:F3},x2={d0.x2:F3},y2={d0.y2:F3}");
+                }
                 // Merge with per-camera track states to smooth and add short hangover
                 var merged = UpdateAndBuildTracks(cameraIndex, normalized);
                 return merged;
