@@ -64,7 +64,6 @@ namespace CameraManager
         private readonly object cacheLock = new object();
         private DateTime lastCacheCleanup = DateTime.Now;
         private const int CACHE_CLEANUP_INTERVAL_MS = 30000;
-        private const string API_URL = "http://127.0.0.1:8000/predict";
         // Intrusion API mode (reference ProcessVideoTest flow)
         private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
         // Base URL; ActionRecognitionClient will append "/detect"
@@ -978,35 +977,6 @@ namespace CameraManager
                     detections = await DetectIntrusionAsync(cameraIndex, resized, frame.Width, frame.Height, DETECT_INPUT_SIZE) 
                                  ?? new List<Detection>();
                 }
-                else
-                {
-                    // Encode JPEG with quality and to base64
-                    var jpegBytes = EncodeJpeg(resized, JPEG_QUALITY);
-                    string base64Image = Convert.ToBase64String(jpegBytes);
-
-                    var payload = new { image = base64Image };
-                    var json = JsonConvert.SerializeObject(payload);
-                    using var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                    using var response = await httpClient.PostAsync(API_URL, content);
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        return;
-                    }
-
-                    var result = await response.Content.ReadAsStringAsync();
-                    var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(result) ?? new List<Detection>();
-
-                    // Debug raw
-                    if (detectionsRaw.Count > 0)
-                    {
-                        var d = detectionsRaw[0];
-                        FileLogger.Log($"Detect RAW cam {cameraIndex + 1}: cnt={detectionsRaw.Count} first=({d.label},{d.score:F2}) x1={d.x1:F3},y1={d.y1:F3},x2={d.x2:F3},y2={d.y2:F3}");
-                    }
-
-                    // Normalize detections to original frame coordinates [0..1]
-                    detections = NormalizeDetectionsToOriginalFrame(detectionsRaw, frame.Width, frame.Height, DETECT_INPUT_SIZE);
-                }
 
                 if (detections.Count > 0)
                 {
@@ -1275,50 +1245,6 @@ namespace CameraManager
                 if (current != null) result.AddRange(current);
             }
             return result;
-        }
-
-        private List<Detection> SmoothWithPrevious(int cameraIndex, List<Detection> current)
-        {
-            try
-            {
-                if (current == null || current.Count == 0) return current ?? new List<Detection>();
-                EnsureCameraDetectionsSize(cameraIndex + 1);
-                List<Detection> prev = null;
-                lock (_cameraDetections)
-                {
-                    if (cameraIndex < _cameraDetections.Count)
-                        prev = new List<Detection>(_cameraDetections[cameraIndex]);
-                }
-                if (prev == null || prev.Count == 0) return current;
-
-                // Index prev by track_id (only smooth when available)
-                var mapPrev = new Dictionary<int, Detection>();
-                foreach (var d in prev)
-                {
-                    if (d?.track_id != null)
-                    {
-                        mapPrev[d.track_id.Value] = d;
-                    }
-                }
-                if (mapPrev.Count == 0) return current;
-
-                const double alpha = 0.6; // weight for current
-                foreach (var d in current)
-                {
-                    if (d?.track_id == null) continue;
-                    if (mapPrev.TryGetValue(d.track_id.Value, out var p))
-                    {
-                        d.x1 = alpha * d.x1 + (1 - alpha) * p.x1;
-                        d.y1 = alpha * d.y1 + (1 - alpha) * p.y1;
-                        d.x2 = alpha * d.x2 + (1 - alpha) * p.x2;
-                        d.y2 = alpha * d.y2 + (1 - alpha) * p.y2;
-                        // keep latest timestamp to avoid early drop
-                        d.timestamp = DateTime.Now;
-                    }
-                }
-                return current;
-            }
-            catch { return current ?? new List<Detection>(); }
         }
 
         // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
