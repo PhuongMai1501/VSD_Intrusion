@@ -24,7 +24,7 @@ namespace CameraManager.Class
             };
             _client = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(1) // giảm timeout để tránh giữ bbox quá lâu khi API chậm
+                Timeout = TimeSpan.FromSeconds(2) // tăng timeout lên 2s và sẽ retry nhẹ khi timeout
             };
             // Endpoint mục tiêu là /detect
             _apiUrl = $"{baseUrl.TrimEnd('/')}/detect";
@@ -41,39 +41,66 @@ namespace CameraManager.Class
             string jsonPayload = streamId == null
                 ? $"{{\"frame\": \"{base64Image}\"}}"
                 : $"{{\"frame\": \"{base64Image}\", \"stream_id\": \"{streamId}\"}}";
-            var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-            try
+            int maxAttempts = 2; // 1 retry nhẹ
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, _apiUrl)
+                using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                try
                 {
-                    Content = content
-                };
-                request.Version = HttpVersion.Version11; // ưu tiên giữ connection HTTP/1.1
-                if (!string.IsNullOrEmpty(streamId))
-                {
-                    request.Headers.TryAddWithoutValidation("X-Stream-ID", streamId);
-                }
-                var response = await _client.SendAsync(request);
+                    using var request = new HttpRequestMessage(HttpMethod.Post, _apiUrl)
+                    {
+                        Content = content
+                    };
+                    request.Version = HttpVersion.Version11; // ưu tiên giữ connection HTTP/1.1
+                    if (!string.IsNullOrEmpty(streamId))
+                    {
+                        request.Headers.TryAddWithoutValidation("X-Stream-ID", streamId);
+                    }
 
-                var responseJson = await response.Content.ReadAsStringAsync();
+                    var response = await _client.SendAsync(request);
+                    var responseJson = await response.Content.ReadAsStringAsync();
 
-                if (response.IsSuccessStatusCode)
-                {
-                    // Deserialize JSON thành đối tượng DetectionResponse
-                    return JsonConvert.DeserializeObject<MultiPersonDetectionResponse>(responseJson);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return JsonConvert.DeserializeObject<MultiPersonDetectionResponse>(responseJson);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"❌ Lỗi HTTP: {response.StatusCode}. Phản hồi: {responseJson}");
+                        // Không retry cho mã lỗi HTTP cụ thể; chỉ retry khi exception/timeout
+                        return null;
+                    }
                 }
-                else
+                catch (TaskCanceledException tce)
                 {
-                    Console.WriteLine($"❌ Lỗi HTTP: {response.StatusCode}. Phản hồi: {responseJson}");
+                    // Thường do timeout; thử retry 1 lần
+                    if (attempt < maxAttempts)
+                    {
+                        Console.WriteLine("⏳ Timeout khi gọi API, retry nhẹ...");
+                        await Task.Delay(150);
+                        continue;
+                    }
+                    Console.WriteLine($"💥 Timeout khi gọi API (hết retry): {tce.Message}");
+                    return null;
+                }
+                catch (HttpRequestException hre)
+                {
+                    if (attempt < maxAttempts)
+                    {
+                        Console.WriteLine($"⚠️ HttpRequestException (attempt {attempt}) => retry nhẹ: {hre.Message}");
+                        await Task.Delay(150);
+                        continue;
+                    }
+                    Console.WriteLine($"💥 HttpRequestException (hết retry): {hre.Message}");
+                    return null;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"💥 Exception khi gọi API: {ex.Message}");
                     return null;
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"💥 Exception khi gọi API: {ex.Message}");
-                return null;
-            }
+            return null;
         }
 
         // Hàm để reset buffer trên server khi cần
