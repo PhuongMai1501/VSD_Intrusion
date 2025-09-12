@@ -137,6 +137,15 @@ namespace CameraManager
         private readonly Dictionary<int, Dictionary<int, TrackState>> _trackStates = new Dictionary<int, Dictionary<int, TrackState>>();
         private const int TRACK_HANGOVER_MS = 500; // giữ bbox tối đa ~0.5s khi miss ngắn hạn
         private const int TRACK_MAX_AGE_MS = 1500; // dọn track cũ sau ~1.5s không thấy
+
+        // Detect potential stale API responses (same empty-label boxes repeating)
+        private class ApiStaleState
+        {
+            public string Signature;
+            public DateTime LastAt;
+            public int Repeat;
+        }
+        private readonly Dictionary<int, ApiStaleState> _apiStaleByCam = new Dictionary<int, ApiStaleState>();
         // Detection input config: use square input size from global config
         private int DETECT_INPUT_SIZE => INTRUSION_API_MODE ? 640 : Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
@@ -1127,6 +1136,72 @@ namespace CameraManager
 
                 // Normalize to original frame coordinates [0..1]
                 var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
+
+                // Stale-response detection: if API repeatedly returns identical boxes with empty labels/zero scores, reset buffer once
+                bool looksEmptyStale = false;
+                if (normalized != null && normalized.Count > 0)
+                {
+                    bool allEmpty = true;
+                    var sb = new StringBuilder();
+                    sb.Append(normalized.Count).Append("|");
+                    for (int i = 0; i < normalized.Count; i++)
+                    {
+                        var d = normalized[i];
+                        if (!string.IsNullOrWhiteSpace(d?.label) || (d?.score ?? 0) > 0) allEmpty = false;
+                        sb.AppendFormat("{0:F3},{1:F3},{2:F3},{3:F3};", d.x1, d.y1, d.x2, d.y2);
+                    }
+                    if (allEmpty)
+                    {
+                        string sig = sb.ToString();
+                        lock (_apiStaleByCam)
+                        {
+                            if (!_apiStaleByCam.TryGetValue(cameraIndex, out var st))
+                            {
+                                st = new ApiStaleState { Signature = sig, LastAt = DateTime.Now, Repeat = 1 };
+                                _apiStaleByCam[cameraIndex] = st;
+                            }
+                            else
+                            {
+                                if (st.Signature == sig)
+                                {
+                                    st.Repeat++;
+                                    st.LastAt = DateTime.Now;
+                                }
+                                else
+                                {
+                                    st.Signature = sig;
+                                    st.Repeat = 1;
+                                    st.LastAt = DateTime.Now;
+                                }
+                            }
+
+                            // If same empty signature repeats >= 3 times within ~2s, treat as stale buffer
+                            if (_apiStaleByCam[cameraIndex].Repeat >= 3 && (DateTime.Now - _apiStaleByCam[cameraIndex].LastAt).TotalSeconds <= 2.0)
+                            {
+                                looksEmptyStale = true;
+                                _apiStaleByCam[cameraIndex].Repeat = 0; // reset counter
+                            }
+                        }
+                    }
+                }
+
+                if (looksEmptyStale)
+                {
+                    try
+                    {
+                        FileLogger.Log($"DetectIntrusionAsync: Detected stale empty boxes for cam {cameraIndex + 1}, resetting server buffer");
+                        var client2 = GetIntrusionClient(cameraIndex);
+                        _ = client2.ResetServerBuffer();
+                    }
+                    catch { }
+                    // Clear track states for this camera as well
+                    lock (_trackLock)
+                    {
+                        _trackStates.Remove(cameraIndex);
+                    }
+                    return new List<Detection>();
+                }
+
                 // Log only when API actually returns detections (avoid logging hangover tracks)
                 if (normalized != null && normalized.Count > 0)
                 {
