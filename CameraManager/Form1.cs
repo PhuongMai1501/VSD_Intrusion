@@ -115,6 +115,7 @@ namespace CameraManager
         private const int DETECTION_TIMER_INTERVAL_MS = 80; // tăng tần suất lập lịch để giảm trễ hiển thị
         private const int DETECTION_TTL_MS = 600; // tăng TTL để giảm nhấp nháy khi kết quả thưa
         private const int DRAW_TTL_MS = 500; // giữ bbox lâu hơn, mượt hơn giữa các lần detect
+        private const int DETECTION_MAX_FRAME_LAG = 2; // cho phép lệch tối đa 2 frame giữa kết quả và frame hiện tại
         // Region overlay (from DB) per camera
         private class RegionData
         {
@@ -980,13 +981,14 @@ namespace CameraManager
 
                 // Logging for intrusion mode is handled inside DetectIntrusionAsync (only on real API results)
 
-                // Bỏ kết quả nếu đã có frame mới hơn (tránh áp overlay cũ trở lại)
+                // Bỏ kết quả quá cũ, cho phép lệch tối đa vài frame để tránh drop do latency
                 bool staleResult = false;
                 lock (_frameStoreLock)
                 {
                     if (_frameSeqByCam.TryGetValue(cameraIndex, out var latestSeq))
                     {
-                        if (latestSeq != frameSeq)
+                        long lag = latestSeq - frameSeq;
+                        if (lag > DETECTION_MAX_FRAME_LAG)
                         {
                             staleResult = true;
                         }
