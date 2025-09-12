@@ -1066,15 +1066,15 @@ namespace CameraManager
             {
                 if (_intrusionClientsByCam.TryGetValue(cameraIndex, out var client) && client != null)
                     return client;
-                // Map by STT (cameraIndex+1) to port: basePort + (stt-1)
-                // Example: base http://host:5000 => CAM1->5000, CAM2->5001 ... CAM6->5005
+                // Map by STT (cameraIndex+1) to ports 5001..5006
+                // Example: CAM1->5001, CAM2->5002 ... CAM6->5006
                 string baseUrl = INTRUSION_API_BASE_URL;
                 try
                 {
                     var uri = new Uri(baseUrl);
-                    int basePort = uri.IsDefaultPort ? 5000 : uri.Port;
+                    // Always start from 5001 regardless of provided port
                     int stt = cameraIndex + 1;
-                    int port = basePort + (stt - 1);
+                    int port = 5000 + stt; // 5001..5006
                     var ub = new UriBuilder(uri.Scheme, uri.Host, port);
                     baseUrl = ub.Uri.ToString().TrimEnd('/');
                 }
