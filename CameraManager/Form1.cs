@@ -114,8 +114,8 @@ namespace CameraManager
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
         private const int DETECTION_TIMER_INTERVAL_MS = 80; // tăng tần suất lập lịch để giảm trễ hiển thị
-        private const int DETECTION_TTL_MS = 300; // cân bằng: xóa nhanh nhưng đủ mượt
-        private const int DRAW_TTL_MS = 220; // chỉ vẽ bbox nếu còn mới trong 220ms để giảm nhấp nháy
+        private const int DETECTION_TTL_MS = 600; // tăng TTL để giảm nhấp nháy khi kết quả thưa
+        private const int DRAW_TTL_MS = 500; // giữ bbox lâu hơn, mượt hơn giữa các lần detect
         // Region overlay (from DB) per camera
         private class RegionData
         {
@@ -124,6 +124,19 @@ namespace CameraManager
         }
         private readonly Dictionary<int, RegionData> _regionDataByCam = new Dictionary<int, RegionData>();
         private readonly object _regionLock = new object();
+
+        // Track smoothing to reduce flicker
+        private class TrackState
+        {
+            public double x1, y1, x2, y2;
+            public string label;
+            public double score;
+            public DateTime lastSeen;
+        }
+        private readonly object _trackLock = new object();
+        private readonly Dictionary<int, Dictionary<int, TrackState>> _trackStates = new Dictionary<int, Dictionary<int, TrackState>>();
+        private const int TRACK_HANGOVER_MS = 500; // giữ bbox khi miss ngắn hạn
+        private const int TRACK_MAX_AGE_MS = 2000; // dọn track cũ lâu không thấy
         // Detection input config: use square input size from global config
         private int DETECT_INPUT_SIZE => INTRUSION_API_MODE ? 640 : Math.Max(1, ClassSystemConfig.Ins?.m_ClsCommon?.DetectionInputSize ?? 1280);
         private const long JPEG_QUALITY = 75L; // JPEG quality for request payload
@@ -1144,17 +1157,124 @@ namespace CameraManager
                     }
                 }
 
-                // Normalize to original frame
+                // Normalize to original frame coordinates [0..1]
                 var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
-                // Smooth with previous to reduce flicker
-                var smoothed = SmoothWithPrevious(cameraIndex, normalized);
-                return smoothed;
+                // Merge with per-camera track states to smooth and add short hangover
+                var merged = UpdateAndBuildTracks(cameraIndex, normalized);
+                return merged;
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "DetectIntrusionAsync");
                 return new List<Detection>();
             }
+        }
+
+        // Update track states with current detections (using track_id) and build a smoothed list to draw.
+        private List<Detection> UpdateAndBuildTracks(int cameraIndex, List<Detection> current)
+        {
+            var now = DateTime.Now;
+            var result = new List<Detection>();
+            try
+            {
+                Dictionary<int, TrackState> camTracks;
+                lock (_trackLock)
+                {
+                    if (!_trackStates.TryGetValue(cameraIndex, out camTracks))
+                    {
+                        camTracks = new Dictionary<int, TrackState>();
+                        _trackStates[cameraIndex] = camTracks;
+                    }
+                }
+
+                // Update existing tracks with current detections
+                if (current != null)
+                {
+                    foreach (var d in current)
+                    {
+                        // Non-tracked detections: push through directly (no smoothing possible)
+                        if (d?.track_id == null)
+                        {
+                            result.Add(d);
+                            continue;
+                        }
+
+                        var id = d.track_id.Value;
+                        lock (_trackLock)
+                        {
+                            if (camTracks.TryGetValue(id, out var st))
+                            {
+                                // EMA smoothing towards current box
+                                const double alphaCurr = 0.6; // trọng số cho bbox hiện tại
+                                st.x1 = alphaCurr * d.x1 + (1 - alphaCurr) * st.x1;
+                                st.y1 = alphaCurr * d.y1 + (1 - alphaCurr) * st.y1;
+                                st.x2 = alphaCurr * d.x2 + (1 - alphaCurr) * st.x2;
+                                st.y2 = alphaCurr * d.y2 + (1 - alphaCurr) * st.y2;
+                                st.label = string.IsNullOrWhiteSpace(d.label) ? st.label : d.label;
+                                st.score = d.score;
+                                st.lastSeen = now;
+                            }
+                            else
+                            {
+                                camTracks[id] = new TrackState
+                                {
+                                    x1 = d.x1,
+                                    y1 = d.y1,
+                                    x2 = d.x2,
+                                    y2 = d.y2,
+                                    label = d.label,
+                                    score = d.score,
+                                    lastSeen = now
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Build output: include all live tracks within hangover window
+                lock (_trackLock)
+                {
+                    var toRemove = new List<int>();
+                    foreach (var kv in camTracks)
+                    {
+                        var st = kv.Value;
+                        var ageMs = (now - st.lastSeen).TotalMilliseconds;
+                        if (ageMs <= TRACK_MAX_AGE_MS)
+                        {
+                            // Keep drawing within hangover to avoid flicker due to occasional misses
+                            if (ageMs <= TRACK_HANGOVER_MS)
+                            {
+                                result.Add(new Detection
+                                {
+                                    x1 = st.x1,
+                                    y1 = st.y1,
+                                    x2 = st.x2,
+                                    y2 = st.y2,
+                                    label = st.label,
+                                    score = st.score,
+                                    track_id = kv.Key,
+                                    timestamp = now
+                                });
+                            }
+                        }
+                        else
+                        {
+                            toRemove.Add(kv.Key);
+                        }
+                    }
+                    // Cleanup old tracks
+                    foreach (var id in toRemove)
+                        camTracks.Remove(id);
+                }
+
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, "UpdateAndBuildTracks");
+                // fallback to current if error
+                if (current != null) result.AddRange(current);
+            }
+            return result;
         }
 
         private List<Detection> SmoothWithPrevious(int cameraIndex, List<Detection> current)
