@@ -61,7 +61,8 @@ namespace CameraManager
         // Intrusion API mode (reference ProcessVideoTest flow)
         private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
         // Base URL; ActionRecognitionClient will append "/detect"
-        private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
+        //private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
+        private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // in INFINIQ
         private readonly object _intrusionClientsLock = new object();
         private readonly System.Collections.Generic.Dictionary<int, ActionRecognitionClient> _intrusionClientsByCam = new System.Collections.Generic.Dictionary<int, ActionRecognitionClient>();
 
@@ -81,7 +82,6 @@ namespace CameraManager
         private readonly Dictionary<int, DateTime> _lastFrameAt = new Dictionary<int, DateTime>();
         private const int NO_SIGNAL_TIMEOUT_MS = 2000;
         // Map UI index -> STT and restart control
-        private readonly List<int> _cameraSttByIndex = new List<int>();
         private readonly Dictionary<int, DateTime> _lastRestartAt = new Dictionary<int, DateTime>();
         private const int RESTART_STALL_MS = 7000;     // if no frame > 7s, consider stalled
         private const int RESTART_COOLDOWN_MS = 10000; // min 10s between restarts per camera
@@ -110,6 +110,11 @@ namespace CameraManager
         private const int DETECTION_TTL_MS = 600; // tăng TTL để giảm nhấp nháy khi kết quả thưa
         private const int DRAW_TTL_MS = 500; // giữ bbox lâu hơn, mượt hơn giữa các lần detect
         private const int DETECTION_MAX_FRAME_LAG = 2; // cho phép lệch tối đa 2 frame giữa kết quả và frame hiện tại
+        // DB log throttling per camera to avoid spamming
+        private readonly object _dbLogLock = new object();
+        private readonly Dictionary<int, DateTime> _lastDbLogAtByCam = new Dictionary<int, DateTime>();
+        private readonly Dictionary<int, string> _lastDbEventByCam = new Dictionary<int, string>();
+        private const int LOG_MIN_INTERVAL_MS = 10000; // 10s between identical logs per camera
         // Region overlay (from DB) per camera
         private class RegionData
         {
@@ -1033,10 +1038,45 @@ namespace CameraManager
                     // Gửi cảnh báo: dùng trực tiếp nhãn action đầu tiên (nếu có)
                     try
                     {
-                        string eventText = filtered.FirstOrDefault(d => d != null && !string.IsNullOrWhiteSpace(d.label))?.label?.Trim();
-                        if (!string.IsNullOrWhiteSpace(eventText))
+                        string eventTextRaw = filtered.FirstOrDefault(d => d != null && !string.IsNullOrWhiteSpace(d.label))?.label?.Trim();
+                        if (!string.IsNullOrWhiteSpace(eventTextRaw))
                         {
-                            _ = SendAlarmToActiveRecipientsAsync(eventText);
+                            // Gửi cảnh báo với nhãn gốc (không đổi hoa)
+                            _ = SendAlarmToActiveRecipientsAsync(eventTextRaw);
+
+                            // Ghi log DB khi có nhãn hợp lệ, có chống spam theo camera
+                            bool allowDbLog = false;
+                            var now = DateTime.Now;
+                            string eventTextDb = eventTextRaw.ToUpperInvariant();
+                            lock (_dbLogLock)
+                            {
+                                _lastDbLogAtByCam.TryGetValue(cameraIndex, out var lastAt);
+                                _lastDbEventByCam.TryGetValue(cameraIndex, out var lastEvt);
+
+                                bool labelChanged = string.IsNullOrWhiteSpace(lastEvt) || !string.Equals(lastEvt, eventTextDb, StringComparison.Ordinal);
+                                bool timeoutPassed = lastAt == DateTime.MinValue || (now - lastAt).TotalMilliseconds >= LOG_MIN_INTERVAL_MS;
+
+                                if (labelChanged || timeoutPassed)
+                                {
+                                    _lastDbLogAtByCam[cameraIndex] = now;
+                                    _lastDbEventByCam[cameraIndex] = eventTextDb;
+                                    allowDbLog = true;
+                                }
+                            }
+
+                            if (allowDbLog)
+                            {
+                                try
+                                {
+                                    // Lưu DB với nhãn viết hoa theo yêu cầu
+                                    AddCameraLogData(cameraIndex + 1, DateTime.Now, eventTextDb, null);
+                                    try { UpdateCameraLogInvoke(this); } catch { }
+                                }
+                                catch (Exception exLog)
+                                {
+                                    FileLogger.LogException(exLog, "ProcessDetectionAsync -> AddCameraLogData");
+                                }
+                            }
                         }
                     }
                     catch (Exception exAlarm)
@@ -3084,7 +3124,7 @@ namespace CameraManager
                 dgviewLog.Columns["Time"].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
                 dgviewLog.Columns["Event"].HeaderText = "Event";
                 dgviewLog.Columns["Event"].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
-                dgviewLog.Columns["Event"].Width = 80;
+                dgviewLog.Columns["Event"].Width = 100;
             }
             catch (Exception ex)
             {
