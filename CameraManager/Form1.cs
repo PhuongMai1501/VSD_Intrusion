@@ -58,16 +58,10 @@ namespace CameraManager
         private int _fullscreenCameraIndex = -1;
         private readonly object _fullscreenLock = new object();
 
-        // AI Detection Variables
-        private static readonly HttpClient httpClient = CreateHttpClient();
-        private readonly Dictionary<string, string> predictionCache = new Dictionary<string, string>();
-        private readonly object cacheLock = new object();
-        private DateTime lastCacheCleanup = DateTime.Now;
-        private const int CACHE_CLEANUP_INTERVAL_MS = 30000;
         // Intrusion API mode (reference ProcessVideoTest flow)
         private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
         // Base URL; ActionRecognitionClient will append "/detect"
-        private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // update if needed
+        private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
         private readonly object _intrusionClientsLock = new object();
         private readonly System.Collections.Generic.Dictionary<int, ActionRecognitionClient> _intrusionClientsByCam = new System.Collections.Generic.Dictionary<int, ActionRecognitionClient>();
 
