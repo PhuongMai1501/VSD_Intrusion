@@ -61,8 +61,8 @@ namespace CameraManager
         // Intrusion API mode (reference ProcessVideoTest flow)
         private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
         // Base URL; ActionRecognitionClient will append "/detect"
-        //private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
-        private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // in INFINIQ
+        private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
+        //private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // in INFINIQ
         private readonly object _intrusionClientsLock = new object();
         private readonly System.Collections.Generic.Dictionary<int, ActionRecognitionClient> _intrusionClientsByCam = new System.Collections.Generic.Dictionary<int, ActionRecognitionClient>();
 
@@ -2164,8 +2164,8 @@ namespace CameraManager
                 Point[] pts = GetMappedRegionPoints(cameraIndex, pb);
                 if (pts == null || pts.Length < 4) return;
 
-                using (var pen = new Pen(Color.Lime, 2))
-                using (var brush = new SolidBrush(Color.Lime))
+                using (var pen = new Pen(Color.Yellow, 2))
+                using (var brush = new SolidBrush(Color.Yellow))
                 {
                     // lines 0-1, 1-2, 2-3, 3-0
                     g.DrawLine(pen, pts[0], pts[1]);
