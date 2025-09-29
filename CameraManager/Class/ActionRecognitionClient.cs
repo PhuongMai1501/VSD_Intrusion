@@ -24,7 +24,8 @@ namespace CameraManager.Class
             };
             _client = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(2) // tăng timeout lên 2s và sẽ retry nhẹ khi timeout
+                // Nâng timeout nhẹ để giảm TaskCanceledException khi API hơi chậm
+                Timeout = TimeSpan.FromSeconds(3.5)
             };
             // Endpoint mục tiêu là /detect
             _apiUrl = $"{baseUrl.TrimEnd('/')}/detect";
@@ -57,7 +58,8 @@ namespace CameraManager.Class
                         request.Headers.TryAddWithoutValidation("X-Stream-ID", streamId);
                     }
 
-                    var response = await _client.SendAsync(request);
+                    // Đọc sớm headers để giảm thời gian giữ kết nối chờ body
+                    var response = await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
                     var responseJson = await response.Content.ReadAsStringAsync();
 
                     if (response.IsSuccessStatusCode)

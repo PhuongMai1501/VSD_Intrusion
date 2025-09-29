@@ -20,6 +20,7 @@ using MySql.Data.MySqlClient;
 using System.Threading;
 using System.IO;
 using CameraManager.Class;
+using System.Diagnostics;
 
 namespace CameraManager
 {
@@ -31,6 +32,9 @@ namespace CameraManager
 
         // Dynamic camera count based on database (cap at 6 live cameras)
         private int NumCameras => Math.Min(6, Math.Max(1, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam?.Count ?? 6));
+        // Optional override for active camera count (null = use NumCameras)
+        private int? _cameraCountOverride = 1; // set to 1 to test single camera display
+        private int ActiveCameraCount => Math.Max(1, Math.Min(_cameraCountOverride ?? NumCameras, NumCameras));
 
         private readonly List<ProcessSupervisor> _supervisors = new List<ProcessSupervisor>();
         private readonly List<MemoryMappedFile> _mmfs = new List<MemoryMappedFile>();
@@ -44,9 +48,6 @@ namespace CameraManager
         private const long MaxFrameSize = (long)MaxFrameWidth * MaxFrameHeight * 3;
 
         // FPS Configuration
-        private const int TARGET_FPS = 50;
-        private const int TIMER_INTERVAL = 1000 / TARGET_FPS;
-
         // Dynamic Layout Variables
         private TableLayoutPanel tableLayoutPanelCamera;
         private TableLayoutPanel[] tableLayoutPanelDevice;
@@ -61,8 +62,8 @@ namespace CameraManager
         // Intrusion API mode (reference ProcessVideoTest flow)
         private const bool INTRUSION_API_MODE = true; // enable new flow using track_id
         // Base URL; ActionRecognitionClient will append "/detect"
-        private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
-        //private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5000"; // in INFINIQ
+        //private const string INTRUSION_API_BASE_URL = "http://localhost:5001"; // update if needed
+        private const string INTRUSION_API_BASE_URL = "http://192.168.210.250:5001"; // in INFINIQ
         private readonly object _intrusionClientsLock = new object();
         private readonly System.Collections.Generic.Dictionary<int, ActionRecognitionClient> _intrusionClientsByCam = new System.Collections.Generic.Dictionary<int, ActionRecognitionClient>();
 
@@ -93,12 +94,32 @@ namespace CameraManager
         // Detection throttling and concurrency
         private const bool ENABLE_AI_DETECTION = true; // enable AI detection for intrusion API
         private readonly SemaphoreSlim _detectionConcurrency = new SemaphoreSlim(6); // allow up to 6 cameras concurrently
-        
+
+        // ==== DEBUG BBOX FLAGS ====
+        private const bool DEBUG_DISABLE_TRACK_HANGOVER = false; // enable track flow with 3-frame ghost suppression
+        private const bool DEBUG_CLEAR_PICTUREBOX_BEFORE_DRAW = false; // disable clear in production to avoid flicker
+        private const bool DEBUG_VERBOSE_BBOX_LOG = true; // detailed logging for bbox lifecycle
+        private const bool DEBUG_DETAILED_BBOX_TIMELINE = true; // log riêng: nhận API vs vẽ theo thời gian thực
+
         // UI toggle state
         // Toggle state and original layout widths for panelLog
         private bool _isLogCollapsed = false;
         private float _origCol0Width = 20f;
         private float _origCol1Width = 80f;
+
+        // Alert/Confirm state per camera
+        private class CameraAlertState
+        {
+            public bool Active;
+            public bool BlinkOn;
+            public DateTime LastBlinkAt;
+            public DateTime LastAlarmAt;
+            public string Label;
+            public DateTime LastPopupAt;
+        }
+        private readonly Dictionary<int, CameraAlertState> _alertsByCam = new Dictionary<int, CameraAlertState>();
+        private readonly System.Windows.Forms.Timer _alertTimer = new System.Windows.Forms.Timer();
+        private DKVN.FormConfirmVision _confirmDialog;
         
         // Alarm throttling: avoid spamming alerts
         private readonly object _alarmLock = new object();
@@ -106,10 +127,10 @@ namespace CameraManager
         private const int ALARM_MIN_INTERVAL_MS = 10000; // 10 seconds
         private readonly Dictionary<int, DateTime> _lastDetectAt = new Dictionary<int, DateTime>();
         private const int DETECT_MIN_INTERVAL_MS = 100; // per-camera min interval (≈10 FPS); adjust down to 50 for ~20 FPS
-        private const int DETECTION_TIMER_INTERVAL_MS = 80; // tăng tần suất lập lịch để giảm trễ hiển thị
-        private const int DETECTION_TTL_MS = 600; // tăng TTL để giảm nhấp nháy khi kết quả thưa
-        private const int DRAW_TTL_MS = 500; // giữ bbox lâu hơn, mượt hơn giữa các lần detect
-        private const int DETECTION_MAX_FRAME_LAG = 2; // cho phép lệch tối đa 2 frame giữa kết quả và frame hiện tại
+        private const int DETECTION_TIMER_INTERVAL_MS = 80; // lịch detect
+        private const int DETECTION_TTL_MS = 800; // giữ bbox lâu hơn để giảm nháy giữa các lượt detect
+        private const int DRAW_TTL_MS = 600; // tăng giữ bbox một chút cho mượt
+        private const int DETECTION_MAX_FRAME_LAG = 3; // nới lệch khung cho ổn định hơn
         // DB log throttling per camera to avoid spamming
         private readonly object _dbLogLock = new object();
         private readonly Dictionary<int, DateTime> _lastDbLogAtByCam = new Dictionary<int, DateTime>();
@@ -131,11 +152,25 @@ namespace CameraManager
             public string label;
             public double score;
             public DateTime lastSeen;
+            public long lastFrameSeq;
+            // Track frames since last API update for this track
+            public int noUpdateFrames = 0;
+            // Keep last few API-updated coords to detect stagnation
+            public Queue<(double x1, double y1, double x2, double y2)> lastCoords = new Queue<(double, double, double, double)>();
         }
         private readonly object _trackLock = new object();
         private readonly Dictionary<int, Dictionary<int, TrackState>> _trackStates = new Dictionary<int, Dictionary<int, TrackState>>();
-        private const int TRACK_HANGOVER_MS = 500; // giữ bbox tối đa ~0.5s khi miss ngắn hạn
-        private const int TRACK_MAX_AGE_MS = 1500; // dọn track cũ sau ~1.5s không thấy
+        private const int TRACK_HANGOVER_MS = 1000; // mượt hơn khi miss tạm (tăng nhẹ)
+        private const int TRACK_MAX_AGE_MS = 2200;  // dọn track cũ sau ~2.2s không thấy (tăng nhẹ)
+        private const int TRACK_HANGOVER_MAX_SAME_FRAMES = 3; // cho phép trùng toạ độ tối đa 3 frame gần nhất
+        // Re-associate unstable API track_id to previous local track by IoU to avoid ID nhấp nháy
+        private const double TRACK_REASSIGN_IOU = 0.55;          // ngưỡng IoU để coi là cùng đối tượng
+        private const int TRACK_REASSIGN_MAX_AGE_MS = 700;       // chỉ xét track vừa được thấy gần đây
+
+        // Draw/Filter thresholds
+        private const double MIN_DRAW_SCORE = 0.05; // hạ ngưỡng để không bỏ sót bbox
+        private const bool FILTER_WEAK_BOXES = false; // không bỏ qua bbox yếu để tránh hụt phát hiện
+        private const bool ENABLE_STALE_WEAK_FILTER = true; // giữ phát hiện stale để tránh buffer lặp
 
         // Detect potential stale API responses (same empty-label boxes repeating)
         private class ApiStaleState
@@ -189,6 +224,50 @@ namespace CameraManager
 
             // Initialize detection components
             InitializeDetectionSystem();
+
+            // Initialize alert timer (blink + resend messages)
+            try
+            {
+                _alertTimer.Interval = 1000; // 1s blink
+                _alertTimer.Tick += AlertTimer_Tick;
+                _alertTimer.Start();
+            }
+            catch { }
+        }
+
+        private void AlertTimer_Tick(object sender, EventArgs e)
+        {
+            try
+            {
+                var now = DateTime.Now;
+                foreach (var kv in _alertsByCam.ToList())
+                {
+                    int cam = kv.Key;
+                    var st = kv.Value;
+                    if (!st.Active) continue;
+
+                    // Toggle blink each tick
+                    st.BlinkOn = !st.BlinkOn;
+                    st.LastBlinkAt = now;
+
+                    // Repaint this camera
+                    if (cam >= 0 && cam < _pictureboxes.Count)
+                    {
+                        try { _pictureboxes[cam]?.Invalidate(); } catch { }
+                    }
+
+                    // Resend alarm message every 10s while unconfirmed
+                    if ((now - st.LastAlarmAt).TotalMilliseconds >= ALARM_MIN_INTERVAL_MS && !string.IsNullOrWhiteSpace(st.Label))
+                    {
+                        _ = SendAlarmToActiveRecipientsAsync(st.Label);
+                        st.LastAlarmAt = now;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(AlertTimer_Tick));
+            }
         }
 
         private void label1_Click(object? sender, EventArgs e)
@@ -271,7 +350,7 @@ namespace CameraManager
                 LoadCameraList();
                 // Thresholds now use global defaults (no per-camera DB)
 
-                Console.WriteLine($"Camera Configuration: {NumCameras} cameras, {Row}x{Col} grid");
+                Console.WriteLine($"Camera Configuration: {ActiveCameraCount} cameras, {Row}x{Col} grid");
 
                 LayoutCameraSpreadView();
                 UpdateCameraLogInvoke(this);
@@ -292,7 +371,8 @@ namespace CameraManager
 
             try
             {
-                for (int i = 0; i < NumCameras && i < _mmfs.Count && i < _pictureboxes.Count; i++)
+                int maxDraw = Math.Min(ActiveCameraCount, Math.Min(_mmfs.Count, _pictureboxes.Count));
+                for (int i = 0; i < maxDraw; i++)
                 {
                     UpdatePictureBox(i);
                     UpdateNoSignalOverlay(i);
@@ -342,7 +422,7 @@ namespace CameraManager
                 else if (e.KeyCode >= Keys.F1 && e.KeyCode <= Keys.F12)
                 {
                     int cameraIndex = e.KeyCode - Keys.F1;
-                    if (cameraIndex < NumCameras)
+                    if (cameraIndex < ActiveCameraCount)
                     {
                         FileLogger.Log($"?? F{cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
                         Console.WriteLine($"?? F{cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
@@ -355,7 +435,7 @@ namespace CameraManager
                     }
                     else
                     {
-                        Console.WriteLine($"?? F{cameraIndex + 1} pressed but only {NumCameras} cameras available");
+                        Console.WriteLine($"?? F{cameraIndex + 1} pressed but only {ActiveCameraCount} cameras available");
                     }
                 }
 
@@ -364,7 +444,7 @@ namespace CameraManager
                 {
                     int cameraIndex = e.KeyCode - Keys.D1;
 
-                    if (cameraIndex < NumCameras)
+                    if (cameraIndex < ActiveCameraCount)
                     {
                         FileLogger.Log($"?? Number {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
                         Console.WriteLine($"?? Number {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
@@ -386,8 +466,8 @@ namespace CameraManager
                     }
                     else
                     {
-                        Console.WriteLine($"?? Number {cameraIndex + 1} pressed but only {NumCameras} cameras available");
-                        Console.WriteLine($"?? Available cameras: 1-{NumCameras} (Press F1-F{NumCameras} or 1-{Math.Min(NumCameras, 9)})");
+                        Console.WriteLine($"?? Number {cameraIndex + 1} pressed but only {ActiveCameraCount} cameras available");
+                        Console.WriteLine($"?? Available cameras: 1-{ActiveCameraCount} (Press F1-F{ActiveCameraCount} or 1-{Math.Min(ActiveCameraCount, 9)})");
                     }
                 }
 
@@ -396,7 +476,7 @@ namespace CameraManager
                 {
                     int cameraIndex = e.KeyCode - Keys.NumPad1;
 
-                    if (cameraIndex < NumCameras)
+                    if (cameraIndex < ActiveCameraCount)
                     {
                         FileLogger.Log($"?? Numpad {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
                         Console.WriteLine($"?? Numpad {cameraIndex + 1} pressed - Toggling camera {cameraIndex + 1}");
@@ -418,7 +498,7 @@ namespace CameraManager
                     }
                     else
                     {
-                        Console.WriteLine($"?? Numpad {cameraIndex + 1} pressed but only {NumCameras} cameras available");
+                        Console.WriteLine($"?? Numpad {cameraIndex + 1} pressed but only {ActiveCameraCount} cameras available");
                     }
                 }
 
@@ -812,6 +892,10 @@ namespace CameraManager
             public DateTime timestamp { get; set; } = DateTime.Now;
             // Optional: track id when using intrusion API
             public int? track_id { get; set; }
+            // Frame sequence index associated with this detection (for ghost filtering)
+            public long frame_seq { get; set; }
+            // 0 = từ API frame hiện tại; >0 = số frame treo (hangover) khi không có API update
+            public int hangover_frames { get; set; } = 0;
         }
 
         // Intrusion API DTOs moved to CameraManager.Class (IntrusionDtos.cs)
@@ -821,7 +905,7 @@ namespace CameraManager
             try
             {
                 // Do not assume camera count at startup; cameras load later.
-                EnsureCameraDetectionsSize(Math.Max(1, NumCameras));
+                EnsureCameraDetectionsSize(Math.Max(1, ActiveCameraCount));
 
                 if (ENABLE_AI_DETECTION)
                 {
@@ -875,7 +959,7 @@ namespace CameraManager
 
                 lock (_cameraDetections)
                 {
-                    EnsureCameraDetectionsSize(Math.Max(NumCameras, _pictureboxes.Count));
+                    EnsureCameraDetectionsSize(Math.Max(ActiveCameraCount, _pictureboxes.Count));
                     for (int cameraIndex = 0; cameraIndex < _cameraDetections.Count; cameraIndex++)
                     {
                         var detections = _cameraDetections[cameraIndex];
@@ -885,6 +969,11 @@ namespace CameraManager
 
                         if (detections.Count != originalCount)
                         {
+                            int removed = originalCount - detections.Count;
+                            if (DEBUG_VERBOSE_BBOX_LOG)
+                            {
+                                try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: cleanup removed={removed} remain={detections.Count}"); } catch { }
+                            }
                             TriggerPaintEvent(cameraIndex, detections.Count);
                         }
                     }
@@ -966,6 +1055,7 @@ namespace CameraManager
         {
             try
             {
+                var sw = Stopwatch.StartNew();
                 // Limit global concurrency; skip if at capacity to keep realtime
                 if (!await _detectionConcurrency.WaitAsync(0))
                 {
@@ -983,11 +1073,23 @@ namespace CameraManager
                 List<Detection> detections;
                 if (INTRUSION_API_MODE)
                 {
-                    detections = await DetectIntrusionAsync(cameraIndex, resized, frame.Width, frame.Height, DETECT_INPUT_SIZE) 
+                    detections = await DetectIntrusionAsync(cameraIndex, resized, frame.Width, frame.Height, DETECT_INPUT_SIZE, frameSeq) 
                                  ?? new List<Detection>();
                 }
 
                 // Logging for intrusion mode is handled inside DetectIntrusionAsync (only on real API results)
+                sw.Stop();
+                long apiLatencyMs = sw.ElapsedMilliseconds;
+                long latestSeqForLog = 0;
+                lock (_frameStoreLock)
+                {
+                    _frameSeqByCam.TryGetValue(cameraIndex, out latestSeqForLog);
+                }
+                try
+                {
+                    FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: detect latency={apiLatencyMs}ms frameSeq={frameSeq} latestSeq={latestSeqForLog} got={detections?.Count ?? 0}");
+                }
+                catch { }
 
                 // Bỏ kết quả quá cũ, cho phép lệch tối đa vài frame để tránh drop do latency
                 bool staleResult = false;
@@ -1004,19 +1106,45 @@ namespace CameraManager
                 }
                 if (staleResult)
                 {
+                    try
+                    {
+                        // Bỏ qua gói stale, giữ nguyên buffer hiện tại để tránh giật nháy
+                        if (DEBUG_VERBOSE_BBOX_LOG)
+                        {
+                            try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: Stale result. Ignore update; keep current draw buffer."); } catch { }
+                        }
+                    }
+                    catch { }
                     return;
                 }
 
                 // Vẽ tất cả bbox ngay; giữ nguyên confidence của model
                 var filtered = detections ?? new List<Detection>();
 
+                // Ổn định: chỉ cập nhật buffer nếu có bbox hợp lệ; nếu rỗng thì giữ buffer cũ cho đến khi TTL dọn
                 EnsureCameraDetectionsSize(cameraIndex + 1);
-                lock (_cameraDetections)
+                if (filtered.Count > 0)
                 {
-                    if (cameraIndex < _cameraDetections.Count)
+                    // Sắp xếp ổn định theo track_id trước khi lưu để hạn chế đổi thứ tự
+                    filtered = filtered
+                        .OrderBy(d => d?.track_id ?? int.MaxValue)
+                        .ThenBy(d => ((d?.x1 ?? 0) + (d?.x2 ?? 0)) * 0.5)
+                        .ToList();
+
+                    // Khử trùng lặp mạnh tay (IoU cao) trong cùng khung
+                    filtered = DeduplicateOverlapping(filtered, 0.9);
+
+                    lock (_cameraDetections)
                     {
-                        _cameraDetections[cameraIndex].Clear();
-                        _cameraDetections[cameraIndex].AddRange(filtered);
+                        if (cameraIndex < _cameraDetections.Count)
+                        {
+                            _cameraDetections[cameraIndex].Clear();
+                            _cameraDetections[cameraIndex].AddRange(filtered);
+                            if (DEBUG_VERBOSE_BBOX_LOG)
+                            {
+                                try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: store updated count={filtered.Count}"); } catch { }
+                            }
+                        }
                     }
                 }
 
@@ -1039,10 +1167,36 @@ namespace CameraManager
                     try
                     {
                         string eventTextRaw = filtered.FirstOrDefault(d => d != null && !string.IsNullOrWhiteSpace(d.label))?.label?.Trim();
+                        // Only trigger confirm/alert if any labeled detection is inside region
+                        bool anyInsideRegion = false;
                         if (!string.IsNullOrWhiteSpace(eventTextRaw))
+                        {
+                            try
+                            {
+                                var regionPts = GetRegionPointsNormalized(cameraIndex, frame.Width, frame.Height);
+                                if (regionPts != null && regionPts.Length >= 3)
+                                {
+                                    foreach (var d in filtered)
+                                    {
+                                        if (d == null || string.IsNullOrWhiteSpace(d.label)) continue;
+                                        double cx = (d.x1 + d.x2) / 2.0;
+                                        double cy = (d.y1 + d.y2) / 2.0;
+                                        if (IsPointInPolygonF(new PointF((float)cx, (float)cy), regionPts))
+                                        {
+                                            anyInsideRegion = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                        if (!string.IsNullOrWhiteSpace(eventTextRaw) && anyInsideRegion)
                         {
                             // Gửi cảnh báo với nhãn gốc (không đổi hoa)
                             _ = SendAlarmToActiveRecipientsAsync(eventTextRaw);
+                            // Kích hoạt cảnh báo: viền đỏ nhấp nháy + popup confirm
+                            try { ActivateCameraAlert(cameraIndex, eventTextRaw); } catch { }
 
                             // Ghi log DB khi có nhãn hợp lệ, có chống spam theo camera
                             bool allowDbLog = false;
@@ -1127,7 +1281,7 @@ namespace CameraManager
             }
         }
 
-        private async Task<List<Detection>> DetectIntrusionAsync(int cameraIndex, Bitmap squareFrame, int origW, int origH, int squareSize)
+        private async Task<List<Detection>> DetectIntrusionAsync(int cameraIndex, Bitmap squareFrame, int origW, int origH, int squareSize, long frameSeq)
         {
             try
             {
@@ -1163,7 +1317,9 @@ namespace CameraManager
                             x2 = sx2,
                             y2 = sy2,
                             track_id = p.TrackId,
-                            timestamp = DateTime.Now
+                            timestamp = DateTime.Now,
+                            frame_seq = frameSeq,
+                            hangover_frames = 0
                         });
                     }
                 }
@@ -1171,20 +1327,24 @@ namespace CameraManager
                 // Normalize to original frame coordinates [0..1]
                 var normalized = NormalizeDetectionsToOriginalFrame(list, origW, origH, squareSize);
 
-                // Stale-response detection: if API repeatedly returns identical boxes with empty labels/zero scores, reset buffer once
-                bool looksEmptyStale = false;
-                if (normalized != null && normalized.Count > 0)
+                // Stale-response detection: if API repeatedly returns identical boxes with empty/low-confidence labels, reset buffer once
+                bool looksWeakStale = false;
+                if (normalized != null && normalized.Count > 0 && ENABLE_STALE_WEAK_FILTER)
                 {
-                    bool allEmpty = true;
+                    bool allWeak = true;
                     var sb = new StringBuilder();
                     sb.Append(normalized.Count).Append("|");
                     for (int i = 0; i < normalized.Count; i++)
                     {
                         var d = normalized[i];
-                        if (!string.IsNullOrWhiteSpace(d?.label) || (d?.score ?? 0) > 0) allEmpty = false;
-                        sb.AppendFormat("{0:F3},{1:F3},{2:F3},{3:F3};", d.x1, d.y1, d.x2, d.y2);
+                        bool hasLabel = !string.IsNullOrWhiteSpace(d?.label);
+                        double score = d?.score ?? 0;
+                        if (hasLabel && score >= MIN_DRAW_SCORE) allWeak = false;
+                        // signature: bbox rounded + label presence + coarse score bucket
+                        int bucket = (int)Math.Floor(Math.Max(0, Math.Min(1.0, score)) * 10);
+                        sb.AppendFormat("{0:F3},{1:F3},{2:F3},{3:F3},{4},{5};", d.x1, d.y1, d.x2, d.y2, hasLabel ? 1 : 0, bucket);
                     }
-                    if (allEmpty)
+                    if (allWeak)
                     {
                         string sig = sb.ToString();
                         lock (_apiStaleByCam)
@@ -1209,21 +1369,21 @@ namespace CameraManager
                                 }
                             }
 
-                            // If same empty signature repeats >= 3 times within ~2s, treat as stale buffer
+                            // If same weak signature repeats >= 3 times within ~2s, treat as stale buffer
                             if (_apiStaleByCam[cameraIndex].Repeat >= 3 && (DateTime.Now - _apiStaleByCam[cameraIndex].LastAt).TotalSeconds <= 2.0)
                             {
-                                looksEmptyStale = true;
+                                looksWeakStale = true;
                                 _apiStaleByCam[cameraIndex].Repeat = 0; // reset counter
                             }
                         }
                     }
                 }
 
-                if (looksEmptyStale)
+                if (looksWeakStale)
                 {
                     try
                     {
-                        FileLogger.Log($"DetectIntrusionAsync: Detected stale empty boxes for cam {cameraIndex + 1}, resetting server buffer");
+                        FileLogger.Log($"DetectIntrusionAsync: Detected stale weak boxes for cam {cameraIndex + 1}, resetting server buffer");
                         var client2 = GetIntrusionClient(cameraIndex);
                         _ = client2.ResetServerBuffer();
                     }
@@ -1236,15 +1396,44 @@ namespace CameraManager
                     return new List<Detection>();
                 }
 
-                // Log only when API actually returns detections (avoid logging hangover tracks)
-                if (normalized != null && normalized.Count > 0)
+                // Log riêng: nhận kết quả từ API (sau normalize) để so sánh với lúc vẽ
+                if (DEBUG_DETAILED_BBOX_TIMELINE)
                 {
-                    var d0 = normalized[0];
-                    FileLogger.Log($"Detect NORM cam {cameraIndex + 1}: cnt={normalized.Count} first=({d0.label},{d0.score:F2}) x1={d0.x1:F3},y1={d0.y1:F3},x2={d0.x2:F3},y2={d0.y2:F3}");
+                    if (normalized != null && normalized.Count > 0)
+                    {
+                        foreach (var d in normalized)
+                        {
+                            try
+                            {
+                                FileLogger.Log($"[API] CAM {cameraIndex + 1} t={DateTime.Now:HH:mm:ss.fff} frameSeq={frameSeq} detSeq={d.frame_seq} id={(d.track_id?.ToString() ?? "-")} xy=({d.x1:F3},{d.y1:F3},{d.x2:F3},{d.y2:F3}) lbl='{d.label}' s={d.score:F2}");
+                            }
+                            catch { }
+                        }
+                    }
+                    else
+                    {
+                        try { FileLogger.Log($"[API] CAM {cameraIndex + 1} t={DateTime.Now:HH:mm:ss.fff} frameSeq={frameSeq} det=0"); } catch { }
+                    }
                 }
+                if (DEBUG_VERBOSE_BBOX_LOG)
+                {
+                    try
+                    {
+                        FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: after normalize count={normalized.Count} timestamps=[{string.Join(", ", normalized.Select(d=>d.timestamp.ToString("HH:mm:ss.fff")))}]");
+                    }
+                    catch { }
+                }
+
                 // Merge with per-camera track states to smooth and add short hangover
-                var merged = UpdateAndBuildTracks(cameraIndex, normalized);
-                return merged;
+                if (DEBUG_DISABLE_TRACK_HANGOVER)
+                {
+                    return normalized ?? new List<Detection>();
+                }
+                else
+                {
+                    var merged = UpdateAndBuildTracks(cameraIndex, normalized, frameSeq);
+                    return merged;
+                }
             }
             catch (Exception ex)
             {
@@ -1254,7 +1443,7 @@ namespace CameraManager
         }
 
         // Update track states with current detections (using track_id) and build a smoothed list to draw.
-        private List<Detection> UpdateAndBuildTracks(int cameraIndex, List<Detection> current)
+        private List<Detection> UpdateAndBuildTracks(int cameraIndex, List<Detection> current, long frameSeq)
         {
             var now = DateTime.Now;
             var result = new List<Detection>();
@@ -1270,7 +1459,73 @@ namespace CameraManager
                     }
                 }
 
+                // 0) Pre-pass: stabilize IDs. For detections with API id not found in camTracks,
+                // try to re-associate to an existing recent track via IoU to avoid ID blinking.
+                if (current != null && current.Count > 0)
+                {
+                    var claimed = new HashSet<int>(); // camTracks keys already matched this frame
+                    // pre-mark keys that are already updated by their own id
+                    lock (_trackLock)
+                    {
+                        foreach (var d in current)
+                        {
+                            if (d?.track_id != null && camTracks.ContainsKey(d.track_id.Value))
+                            {
+                                claimed.Add(d.track_id.Value);
+                            }
+                        }
+                    }
+
+                    foreach (var d in current)
+                    {
+                        if (d == null || d.track_id == null) continue;
+                        int apiId = d.track_id.Value;
+                        // If API id already exists in our map, no need to reassign
+                        bool hasSame = false;
+                        lock (_trackLock) { hasSame = camTracks.ContainsKey(apiId); }
+                        if (hasSame) continue;
+
+                        // Search best IoU match among recent tracks not already claimed
+                        int bestKey = -1;
+                        double bestIou = 0.0;
+                        lock (_trackLock)
+                        {
+                            foreach (var kv in camTracks)
+                            {
+                                if (claimed.Contains(kv.Key)) continue; // already matched by another detection
+                                var st = kv.Value;
+                                double ageMs = (now - st.lastSeen).TotalMilliseconds;
+                                if (ageMs > TRACK_REASSIGN_MAX_AGE_MS) continue; // too old to reliably match
+
+                                // Compute IoU between current detection and stored track box
+                                var temp = new Detection
+                                {
+                                    x1 = st.x1, y1 = st.y1, x2 = st.x2, y2 = st.y2, track_id = kv.Key
+                                };
+                                double iou = IoU(d, temp);
+                                if (iou > bestIou)
+                                {
+                                    bestIou = iou;
+                                    bestKey = kv.Key;
+                                }
+                            }
+                        }
+
+                        if (bestKey >= 0 && bestIou >= TRACK_REASSIGN_IOU)
+                        {
+                            // Re-map incoming detection to the best existing track key
+                            d.track_id = bestKey;
+                            claimed.Add(bestKey);
+                            if (DEBUG_VERBOSE_BBOX_LOG)
+                            {
+                                try { FileLogger.Log($"[TRACK-REASSIGN] CAM {cameraIndex + 1} seq={frameSeq} apiId={apiId} -> localId={bestKey} IoU={bestIou:F2}"); } catch { }
+                            }
+                        }
+                    }
+                }
+
                 // Update existing tracks with current detections
+                var updatedIds = new HashSet<int>();
                 if (current != null)
                 {
                     foreach (var d in current)
@@ -1278,6 +1533,7 @@ namespace CameraManager
                         // Non-tracked detections: push through directly (no smoothing possible)
                         if (d?.track_id == null)
                         {
+                            d.hangover_frames = 0; // từ API trực tiếp (không có track)
                             result.Add(d);
                             continue;
                         }
@@ -1295,7 +1551,12 @@ namespace CameraManager
                                 st.y2 = alphaCurr * d.y2 + (1 - alphaCurr) * st.y2;
                                 st.label = string.IsNullOrWhiteSpace(d.label) ? st.label : d.label;
                                 st.score = d.score;
-                                st.lastSeen = now;
+                                st.lastSeen = d.timestamp;
+                                st.lastFrameSeq = d.frame_seq;
+                                st.noUpdateFrames = 0; // fresh update this frame
+                                // push coord signature (limit 3)
+                                st.lastCoords.Enqueue((d.x1, d.y1, d.x2, d.y2));
+                                while (st.lastCoords.Count > 3) st.lastCoords.Dequeue();
                             }
                             else
                             {
@@ -1307,9 +1568,25 @@ namespace CameraManager
                                     y2 = d.y2,
                                     label = d.label,
                                     score = d.score,
-                                    lastSeen = now
+                                    lastSeen = d.timestamp,
+                                    lastFrameSeq = d.frame_seq,
+                                    noUpdateFrames = 0,
+                                    lastCoords = new Queue<(double, double, double, double)>(new[] { (d.x1, d.y1, d.x2, d.y2) })
                                 };
                             }
+                            updatedIds.Add(id);
+                        }
+                    }
+                }
+
+                // For tracks not updated this frame, bump noUpdateFrames
+                lock (_trackLock)
+                {
+                    foreach (var kv in camTracks)
+                    {
+                        if (!updatedIds.Contains(kv.Key))
+                        {
+                            kv.Value.noUpdateFrames = Math.Min(kv.Value.noUpdateFrames + 1, 1000000);
                         }
                     }
                 }
@@ -1327,17 +1604,60 @@ namespace CameraManager
                             // Keep drawing within hangover to avoid flicker due to occasional misses
                             if (ageMs <= TRACK_HANGOVER_MS)
                             {
-                                result.Add(new Detection
+                                // Ghost suppression: if no API update and bbox is stagnant for >3 frames, stop drawing
+                                bool shouldDraw = true;
+                                if (st.noUpdateFrames > 0)
                                 {
-                                    x1 = st.x1,
-                                    y1 = st.y1,
-                                    x2 = st.x2,
-                                    y2 = st.y2,
-                                    label = st.label,
-                                    score = st.score,
-                                    track_id = kv.Key,
-                                    timestamp = now
-                                });
+                                    // Allow up to 3 frames of no-update
+                                    if (st.noUpdateFrames > TRACK_HANGOVER_MAX_SAME_FRAMES)
+                                    {
+                                        shouldDraw = false;
+                                    }
+                                    else
+                                    {
+                                        // Optional: if last 3 coords are identical (stagnant), suppress at threshold
+                                        if (st.lastCoords != null && st.lastCoords.Count >= 3)
+                                        {
+                                            var arr = st.lastCoords.ToArray();
+                                            const double eps = 1e-3; // normalized tolerance
+                                            bool same12 = Math.Abs(arr[^1].x1 - arr[^2].x1) < eps && Math.Abs(arr[^1].y1 - arr[^2].y1) < eps &&
+                                                          Math.Abs(arr[^1].x2 - arr[^2].x2) < eps && Math.Abs(arr[^1].y2 - arr[^2].y2) < eps;
+                                            bool same23 = Math.Abs(arr[^2].x1 - arr[^3].x1) < eps && Math.Abs(arr[^2].y1 - arr[^3].y1) < eps &&
+                                                          Math.Abs(arr[^2].x2 - arr[^3].x2) < eps && Math.Abs(arr[^2].y2 - arr[^3].y2) < eps;
+                                            if (st.noUpdateFrames >= TRACK_HANGOVER_MAX_SAME_FRAMES && same12 && same23)
+                                            {
+                                                shouldDraw = false;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (shouldDraw)
+                                {
+                                    if (DEBUG_VERBOSE_BBOX_LOG)
+                                    {
+                                        try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: Hangover track={kv.Key} lastSeen={st.lastSeen:HH:mm:ss.fff} ageMs={ageMs:F0} noUpd={st.noUpdateFrames}"); } catch { }
+                                    }
+                                    var outDet = new Detection
+                                    {
+                                        x1 = st.x1,
+                                        y1 = st.y1,
+                                        x2 = st.x2,
+                                        y2 = st.y2,
+                                        label = st.label,
+                                        score = st.score,
+                                        track_id = kv.Key,
+                                        // use last seen time and frame to reflect true age
+                                        timestamp = st.lastSeen,
+                                        frame_seq = st.lastFrameSeq,
+                                        hangover_frames = st.noUpdateFrames
+                                    };
+                                    result.Add(outDet);
+                                }
+                                else if (DEBUG_DETAILED_BBOX_TIMELINE)
+                                {
+                                    try { FileLogger.Log($"[HANGOVER-SUPPRESS] CAM {cameraIndex + 1} t={now:HH:mm:ss.fff} id={kv.Key} noUpd={st.noUpdateFrames} ageMs={ageMs:F0} lastSeq={st.lastFrameSeq} xy=({st.x1:F3},{st.y1:F3},{st.x2:F3},{st.y2:F3})"); } catch { }
+                                }
                             }
                         }
                         else
@@ -1435,7 +1755,7 @@ namespace CameraManager
                     .Select(g => g.First())
                     .ToList();
 
-                using (var client = new HttpClient())
+                using (var client = new HttpClient() { Timeout = TimeSpan.FromSeconds(3.5) })
                 {
                     foreach (var r in recipients)
                     {
@@ -1456,6 +1776,13 @@ namespace CameraManager
                             ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
                                 $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
                                 ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                        }
+                        catch (TaskCanceledException tce)
+                        {
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=TIMEOUT ({tce.Message})",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.LogException(tce, $"SendAlarmToActiveRecipientsAsync TIMEOUT -> ChatID={r.ChatID}");
                         }
                         catch (Exception exSend)
                         {
@@ -1526,7 +1853,10 @@ namespace CameraManager
                         y1 = ny1,
                         x2 = nx2,
                         y2 = ny2,
-                        timestamp = DateTime.Now
+                        // preserve original timing and tracking info
+                        timestamp = d.timestamp,
+                        track_id = d.track_id,
+                        frame_seq = d.frame_seq
                     });
                 }
                 return list;
@@ -1778,7 +2108,7 @@ namespace CameraManager
 
             var client = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(2)
+                Timeout = TimeSpan.FromSeconds(3.5)
             };
             client.DefaultRequestVersion = HttpVersion.Version11;
             client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
@@ -1903,10 +2233,14 @@ namespace CameraManager
         {
             try
             {
-                // Limit live camera layout to at most 6
-                int cameraCount = Math.Min(6, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count);
+                // Use the active camera count (override-aware)
+                int cameraCount = ActiveCameraCount;
 
-                if (cameraCount <= 4)
+                if (cameraCount == 1)
+                {
+                    Row = 1; Col = 1;
+                }
+                else if (cameraCount <= 4)
                 {
                     Row = 2; Col = 2;
                 }
@@ -1941,6 +2275,58 @@ namespace CameraManager
             }
         }
 
+        private void ApplyLogPanelCollapsed(bool collapse)
+        {
+            try
+            {
+                if (tableLayoutPanel2 == null || panelMain == null || panelLog == null) return;
+                if (collapse == _isLogCollapsed) return;
+
+                tableLayoutPanel2.SuspendLayout();
+                if (collapse)
+                {
+                    panelLog.Visible = false;
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = 0f;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = 100f;
+                    }
+                    try
+                    {
+                        tableLayoutPanel2.SetColumn(panelMain, 0);
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 2);
+                    }
+                    catch { }
+                    _isLogCollapsed = true;
+                }
+                else
+                {
+                    try
+                    {
+                        tableLayoutPanel2.SetColumnSpan(panelMain, 1);
+                        tableLayoutPanel2.SetColumn(panelMain, 1);
+                    }
+                    catch { }
+                    if (tableLayoutPanel2.ColumnStyles.Count >= 2)
+                    {
+                        tableLayoutPanel2.ColumnStyles[0].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[0].Width = _origCol0Width;
+                        tableLayoutPanel2.ColumnStyles[1].SizeType = SizeType.Percent;
+                        tableLayoutPanel2.ColumnStyles[1].Width = _origCol1Width;
+                    }
+                    panelLog.Visible = true;
+                    _isLogCollapsed = false;
+                }
+                tableLayoutPanel2.ResumeLayout(true);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(ApplyLogPanelCollapsed));
+            }
+        }
+
         public void LayoutCameraSpreadView()
         {
             try
@@ -1952,6 +2338,10 @@ namespace CameraManager
                 }
 
                 FileLogger.Log("Setting up dynamic camera layout...");
+
+                // Adjust layout and log panel for active camera count
+                UpdateLayoutForCameraCount();
+                ApplyLogPanelCollapsed(ActiveCameraCount == 1);
 
                 panelMain.Controls.Clear();
                 _pictureboxes.Clear();
@@ -1989,7 +2379,7 @@ namespace CameraManager
                 {
                     for (int col = 0; col < Col; col++)
                     {
-                        if (indexCam < NumCameras)
+                        if (indexCam < ActiveCameraCount)
                         {
                             var pictureBox = new PictureBox();
                             pictureBox.Name = $"pictureBox{indexCam + 1}";
@@ -2129,6 +2519,11 @@ namespace CameraManager
 
                 // PictureBox will draw its Image by itself. We only draw overlay.
 
+                if (DEBUG_CLEAR_PICTUREBOX_BEFORE_DRAW)
+                {
+                    try { e.Graphics.Clear(Color.Black); } catch { }
+                }
+
                 // Always draw region overlay (from DB) if available
                 DrawRegionOverlayIfAvailable(e.Graphics, pictureBox, cameraIndex);
 
@@ -2143,12 +2538,120 @@ namespace CameraManager
 
                 if (detections?.Count > 0)
                 {
+                    if (DEBUG_VERBOSE_BBOX_LOG)
+                    {
+                        try
+                        {
+                            string ts = string.Join(", ", detections.Select(d => d.timestamp.ToString("HH:mm:ss.fff")));
+                            FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: Draw start count={detections.Count} ts=[{ts}]");
+                        }
+                        catch { }
+                    }
                     DrawDetectionsWithRegion(e.Graphics, detections, pictureBox, cameraIndex);
                 }
+
+                // Draw blinking alert border if active
+                try
+                {
+                    if (_alertsByCam.TryGetValue(cameraIndex, out var alert) && alert.Active && alert.BlinkOn)
+                    {
+                        using (var pen = new Pen(Color.Red, 6))
+                        {
+                            pen.Alignment = System.Drawing.Drawing2D.PenAlignment.Inset;
+                            e.Graphics.DrawRectangle(pen, new Rectangle(0, 0, pictureBox.Width - 1, pictureBox.Height - 1));
+                        }
+                    }
+                }
+                catch { }
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, $"OnPictureBoxPaint - Camera {cameraIndex}");
+            }
+        }
+
+        private void ActivateCameraAlert(int cameraIndex, string label)
+        {
+            try
+            {
+                if (cameraIndex < 0 || cameraIndex >= ActiveCameraCount) return;
+                if (!_alertsByCam.TryGetValue(cameraIndex, out var st))
+                {
+                    st = new CameraAlertState();
+                    _alertsByCam[cameraIndex] = st;
+                }
+                st.Active = true;
+                st.Label = label ?? string.Empty;
+                st.BlinkOn = true;
+                st.LastBlinkAt = DateTime.Now;
+                if (st.LastAlarmAt == default) st.LastAlarmAt = DateTime.MinValue;
+
+                // Show confirm popup at most once per 10s
+                var now = DateTime.Now;
+                if (st.LastPopupAt == default || (now - st.LastPopupAt).TotalMilliseconds >= ALARM_MIN_INTERVAL_MS)
+                {
+                    ShowConfirmPopup(cameraIndex, label);
+                    st.LastPopupAt = now;
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(ActivateCameraAlert));
+            }
+        }
+
+        private void ConfirmCameraAlert(int cameraIndex)
+        {
+            try
+            {
+                if (cameraIndex < 0) return;
+                if (_alertsByCam.TryGetValue(cameraIndex, out var st))
+                {
+                    st.Active = false;
+                    st.BlinkOn = false;
+                }
+                if (_pictureboxes != null && cameraIndex < _pictureboxes.Count)
+                {
+                    try { _pictureboxes[cameraIndex]?.Invalidate(); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(ConfirmCameraAlert));
+            }
+        }
+
+        private void ShowConfirmPopup(int cameraIndex, string label)
+        {
+            try
+            {
+                if (_confirmDialog == null || _confirmDialog.IsDisposed)
+                {
+                    _confirmDialog = new DKVN.FormConfirmVision();
+                    _confirmDialog.OnConfirm = (idx) => { ConfirmCameraAlert(idx); };
+                }
+                var msg = string.IsNullOrWhiteSpace(label) ? "Vision detection Warning. Please confirm." : $"{label} detected. Please confirm.";
+                _confirmDialog.SetAlarm(msg, cameraIndex);
+                // Center near the camera picturebox if possible
+                try
+                {
+                    if (cameraIndex >= 0 && cameraIndex < _pictureboxes.Count)
+                    {
+                        var pb = _pictureboxes[cameraIndex];
+                        if (pb != null && pb.FindForm() != null)
+                        {
+                            var screenPos = pb.PointToScreen(new Point(pb.Width / 2, pb.Height / 2));
+                            _confirmDialog.StartPosition = FormStartPosition.Manual;
+                            _confirmDialog.Location = new Point(screenPos.X - _confirmDialog.Width / 2, screenPos.Y - _confirmDialog.Height / 2);
+                        }
+                    }
+                }
+                catch { }
+                try { _confirmDialog.Show(); _confirmDialog.BringToFront(); } catch { }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(ShowConfirmPopup));
             }
         }
 
@@ -2185,6 +2688,59 @@ namespace CameraManager
             {
                 FileLogger.LogException(ex, $"DrawRegionOverlayIfAvailable cam={cameraIndex + 1}");
             }
+        }
+
+        private PointF[] GetRegionPointsNormalized(int cameraIndex, int frameW, int frameH)
+        {
+            try
+            {
+                RegionData rd = null;
+                lock (_regionLock)
+                {
+                    _regionDataByCam.TryGetValue(cameraIndex, out rd);
+                }
+                if (rd == null || rd.Points == null || rd.Points.Count < 3) return null;
+                if (rd.IsNormalized)
+                {
+                    return rd.Points.ToArray();
+                }
+                // Convert absolute to normalized by frame size
+                if (frameW <= 0 || frameH <= 0) return null;
+                var pts = new PointF[rd.Points.Count];
+                for (int i = 0; i < rd.Points.Count; i++)
+                {
+                    pts[i] = new PointF(
+                        (float)(rd.Points[i].X / Math.Max(1f, frameW)),
+                        (float)(rd.Points[i].Y / Math.Max(1f, frameH))
+                    );
+                }
+                return pts;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsPointInPolygonF(PointF point, PointF[] polygon)
+        {
+            try
+            {
+                if (polygon == null || polygon.Length < 3) return false;
+                bool inside = false;
+                int j = polygon.Length - 1;
+                for (int i = 0; i < polygon.Length; i++)
+                {
+                    var pi = polygon[i];
+                    var pj = polygon[j];
+                    bool intersect = ((pi.Y > point.Y) != (pj.Y > point.Y)) &&
+                                     (point.X < (pj.X - pi.X) * (point.Y - pi.Y) / (float)(pj.Y - pi.Y) + pi.X);
+                    if (intersect) inside = !inside;
+                    j = i;
+                }
+                return inside;
+            }
+            catch { return false; }
         }
 
         private Point[] GetMappedRegionPoints(int cameraIndex, PictureBox pb)
@@ -2262,10 +2818,46 @@ namespace CameraManager
                 Point[] regionPts = GetMappedRegionPoints(cameraIndex, pictureBox);
 
                 var now = DateTime.Now;
+                long latestSeq = 0;
+                try
+                {
+                    lock (_frameStoreLock)
+                    {
+                        _frameSeqByCam.TryGetValue(cameraIndex, out latestSeq);
+                    }
+                }
+                catch { }
+                // Vẽ theo thứ tự ổn định theo track_id
+                detections = detections
+                    .OrderBy(d => d?.track_id ?? int.MaxValue)
+                    .ThenBy(d => ((d?.x1 ?? 0) + (d?.x2 ?? 0)) * 0.5)
+                    .ToList();
+
+                int drawn = 0, skipTtl = 0, skipLag = 0, skipWeak = 0, insideCount = 0;
                 foreach (var detection in detections)
                 {
                     // Bỏ qua bbox quá cũ để tránh vẽ bóng ma
-                    if ((now - detection.timestamp).TotalMilliseconds > DRAW_TTL_MS) continue;
+                    if ((now - detection.timestamp).TotalMilliseconds > DRAW_TTL_MS)
+                    {
+                        if (DEBUG_DETAILED_BBOX_TIMELINE)
+                        {
+                            try { FileLogger.Log($"[DRAW-SKIP] CAM {cameraIndex + 1} t={now:HH:mm:ss.fff} reason=TTL ageMs={(now - detection.timestamp).TotalMilliseconds:F0} id={(detection.track_id?.ToString() ?? "-")} detSeq={detection.frame_seq} hangover={detection.hangover_frames}"); } catch { }
+                        }
+                        skipTtl++; continue;
+                    }
+                    // Bỏ qua bbox lệch quá nhiều frame so với hình hiện đang hiển thị
+                    if (detection.frame_seq > 0 && latestSeq > 0)
+                    {
+                        long lag = latestSeq - detection.frame_seq;
+                        if (lag > DETECTION_MAX_FRAME_LAG)
+                        {
+                            if (DEBUG_VERBOSE_BBOX_LOG || DEBUG_DETAILED_BBOX_TIMELINE)
+                            {
+                                try { FileLogger.Log($"[DRAW-SKIP] CAM {cameraIndex + 1} t={now:HH:mm:ss.fff} reason=LAG lag={lag} latestSeq={latestSeq} detSeq={detection.frame_seq} id={(detection.track_id?.ToString() ?? "-")} hangover={detection.hangover_frames}"); } catch { }
+                            }
+                            skipLag++; continue;
+                        }
+                    }
 
                     bool isNormalized = detection.x2 <= 1.5 && detection.y2 <= 1.5 && detection.x1 >= 0 && detection.y1 >= 0;
 
@@ -2289,11 +2881,28 @@ namespace CameraManager
                         insideRegion = IsPointInPolygon(new PointF(cx, cy), regionPts);
                     }
 
+                    // Tuỳ chọn: Bỏ qua bbox yếu nếu bật cờ, mặc định không bỏ để tránh hụt phát hiện
+                    if (FILTER_WEAK_BOXES && string.IsNullOrWhiteSpace(detection.label) && (detection.score < MIN_DRAW_SCORE))
+                    {
+                        if (DEBUG_VERBOSE_BBOX_LOG)
+                        {
+                            try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: skip weak box score={detection.score:F2}"); } catch { }
+                        }
+                        skipWeak++; continue;
+                    }
+
                     using (var pen = new Pen(insideRegion ? Color.Red : Color.Lime, 2))
                     {
                         Rectangle rect = new Rectangle(left, top, w, h);
                         graphics.DrawRectangle(pen, rect);
                     }
+                    drawn++;
+                    if (DEBUG_DETAILED_BBOX_TIMELINE)
+                    {
+                        string src = detection.hangover_frames > 0 ? "HANGOVER" : "API";
+                        try { FileLogger.Log($"[DRAW] CAM {cameraIndex + 1} t={now:HH:mm:ss.fff} latestSeq={latestSeq} detSeq={detection.frame_seq} src={src} hangover={detection.hangover_frames} id={(detection.track_id?.ToString() ?? "-")} xy=({detection.x1:F3},{detection.y1:F3},{detection.x2:F3},{detection.y2:F3}) inside={insideRegion}"); } catch { }
+                    }
+                    if (insideRegion) insideCount++;
 
                     if (insideRegion && !string.IsNullOrWhiteSpace(detection.label))
                     {
@@ -2309,11 +2918,72 @@ namespace CameraManager
                         }
                     }
                 }
+                if (DEBUG_VERBOSE_BBOX_LOG)
+                {
+                    try { FileLogger.Log($"[DEBUG] CAM {cameraIndex + 1}: paint summary drawn={drawn} skip_ttl={skipTtl} skip_lag={skipLag} skip_weak={skipWeak} inside={insideCount} total={detections.Count} latestSeq={latestSeq}"); } catch { }
+                }
             }
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, "DrawDetectionsWithRegion");
             }
+        }
+
+        private static Color GetTrackColor(int? trackId, bool insideRegion)
+        {
+            try
+            {
+                if (!trackId.HasValue)
+                    return insideRegion ? Color.Red : Color.Lime;
+                int id = trackId.Value;
+                // Generate stable color from id
+                unchecked
+                {
+                    int r = (id * 73) % 256;
+                    int g = (id * 151 + 50) % 256;
+                    int b = (id * 199 + 100) % 256;
+                    var baseColor = Color.FromArgb(r, g, b);
+                    return insideRegion ? baseColor : ControlPaint.Light(baseColor);
+                }
+            }
+            catch { return insideRegion ? Color.Red : Color.Lime; }
+        }
+
+        private static List<Detection> DeduplicateOverlapping(List<Detection> list, double iouThreshold)
+        {
+            try
+            {
+                if (list == null || list.Count <= 1) return list;
+                var result = new List<Detection>();
+                foreach (var d in list)
+                {
+                    bool dup = result.Any(e => IoU(d, e) >= iouThreshold && (d.track_id == e.track_id || !d.track_id.HasValue || !e.track_id.HasValue));
+                    if (!dup) result.Add(d);
+                }
+                return result;
+            }
+            catch { return list; }
+        }
+
+        private static double IoU(Detection a, Detection b)
+        {
+            try
+            {
+                if (a == null || b == null) return 0;
+                double ax1 = Math.Min(a.x1, a.x2), ay1 = Math.Min(a.y1, a.y2);
+                double ax2 = Math.Max(a.x1, a.x2), ay2 = Math.Max(a.y1, a.y2);
+                double bx1 = Math.Min(b.x1, b.x2), by1 = Math.Min(b.y1, b.y2);
+                double bx2 = Math.Max(b.x1, b.x2), by2 = Math.Max(b.y1, b.y2);
+                double ix1 = Math.Max(ax1, bx1), iy1 = Math.Max(ay1, by1);
+                double ix2 = Math.Min(ax2, bx2), iy2 = Math.Min(ay2, by2);
+                double iw = Math.Max(0, ix2 - ix1), ih = Math.Max(0, iy2 - iy1);
+                double inter = iw * ih;
+                double areaA = Math.Max(0, ax2 - ax1) * Math.Max(0, ay2 - ay1);
+                double areaB = Math.Max(0, bx2 - bx1) * Math.Max(0, by2 - by1);
+                double uni = Math.Max(1e-9, areaA + areaB - inter);
+                return inter / uni;
+            }
+            catch { return 0; }
         }
 
         private void EnsureRegionLoaded(int cameraIndex)
@@ -2485,6 +3155,22 @@ namespace CameraManager
             catch (Exception ex)
             {
                 FileLogger.LogException(ex, $"RestartWorker({index})");
+            }
+        }
+
+        private void InvalidateRegionCache()
+        {
+            try
+            {
+                lock (_regionLock)
+                {
+                    _regionDataByCam.Clear();
+                }
+                FileLogger.Log("Region cache invalidated: will reload 4-point regions from DB on next draw");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(InvalidateRegionCache));
             }
         }
 
@@ -2732,9 +3418,9 @@ namespace CameraManager
             {
                 if (_isShuttingDown) return;
 
-                if (cameraIndex < 0 || cameraIndex >= NumCameras)
+                if (cameraIndex < 0 || cameraIndex >= ActiveCameraCount)
                 {
-                    Console.WriteLine($"? Invalid camera index {cameraIndex + 1} (Available: 1-{NumCameras})");
+                    Console.WriteLine($"? Invalid camera index {cameraIndex + 1} (Available: 1-{ActiveCameraCount})");
                     return;
                 }
 
@@ -2768,7 +3454,7 @@ namespace CameraManager
         {
             try
             {
-                if (cameraIndex < 0 || cameraIndex >= NumCameras) return;
+                if (cameraIndex < 0 || cameraIndex >= ActiveCameraCount) return;
 
                 _isFullscreen = true;
                 _fullscreenCameraIndex = cameraIndex;
@@ -2822,6 +3508,25 @@ namespace CameraManager
 
         #region Helper and Utility Methods
 
+        // Allow external/UI to adjust active camera count at runtime
+        public void SetCameraCountOverride(int? count)
+        {
+            try
+            {
+                if (count.HasValue && count.Value <= 0) count = 1;
+                _cameraCountOverride = count;
+                FileLogger.Log($"SetCameraCountOverride: total={NumCameras}, active={ActiveCameraCount}");
+                if (this.InvokeRequired)
+                    this.BeginInvoke(new Action(LayoutCameraSpreadView));
+                else
+                    LayoutCameraSpreadView();
+            }
+            catch (Exception ex)
+            {
+                FileLogger.LogException(ex, nameof(SetCameraCountOverride));
+            }
+        }
+
         public void ShowKeyboardShortcuts()
         {
             try
@@ -2829,7 +3534,7 @@ namespace CameraManager
                 string shortcuts = $@"
 ?? CAMERA MANAGER - KEYBOARD SHORTCUTS:
 
-?? CAMERA CONTROLS ({NumCameras} cameras available):
+?? CAMERA CONTROLS ({ActiveCameraCount} cameras available):
 • 1-9: Toggle fullscreen for Camera 1-9 (OPTIMIZED)
   - Press number to enter fullscreen
   - Press same number again to exit fullscreen
@@ -2850,13 +3555,13 @@ namespace CameraManager
 ?? OPTIMIZED FEATURES:
 • Smart camera switching - no need to exit first
 • Reliable ESC key - always exits fullscreen
-• Number keys 1-{Math.Min(NumCameras, 9)} for quick access
+• Number keys 1-{Math.Min(ActiveCameraCount, 9)} for quick access
 ";
 
                 MessageBox.Show(shortcuts, "?? Camera Manager - Keyboard Shortcuts", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 FileLogger.Log("?? Optimized keyboard shortcuts displayed to user");
 
-                Console.WriteLine($"?? Help shown - Current config: {NumCameras} cameras in {Row}x{Col} grid");
+                Console.WriteLine($"?? Help shown - Current config: {ActiveCameraCount} cameras in {Row}x{Col} grid");
             }
             catch (Exception ex)
             {
@@ -2871,7 +3576,7 @@ namespace CameraManager
                 Console.WriteLine("?? === FULLSCREEN DEBUG INFO ===");
                 Console.WriteLine($"?? _isFullscreen: {_isFullscreen}");
                 Console.WriteLine($"?? _fullscreenCameraIndex: {_fullscreenCameraIndex}");
-                Console.WriteLine($"?? NumCameras: {NumCameras}");
+                Console.WriteLine($"?? NumCameras: {ActiveCameraCount}");
                 Console.WriteLine("?? === END DEBUG INFO ===");
 
                 FileLogger.Log($"DEBUG - Fullscreen: {_isFullscreen}, Camera: {_fullscreenCameraIndex}");
@@ -3070,6 +3775,8 @@ namespace CameraManager
                 Console.WriteLine("?? Reloading camera list from database...");
                 LoadCameraList();
                 // Thresholds are global; no per-camera reload needed
+                // Invalidate region cache so any changes to 4-point region are picked up
+                InvalidateRegionCache();
 
                 if (this.InvokeRequired)
                 {
@@ -3081,7 +3788,7 @@ namespace CameraManager
                 }
 
                 Console.WriteLine("? Camera list reloaded successfully");
-                FileLogger.Log($"Camera list reloaded: {NumCameras} cameras found");
+                FileLogger.Log($"Camera list reloaded: {NumCameras} total, active={ActiveCameraCount}");
             }
             catch (Exception ex)
             {
@@ -3168,6 +3875,8 @@ namespace CameraManager
             try
             {
                 _isShuttingDown = false; // allow display/update after a previous Stop
+                // Always refresh region overlay from DB on start
+                InvalidateRegionCache();
                 
                 string cameraWorkerPath = Path.Combine(Environment.CurrentDirectory, "CameraWorker.exe");
                 if (!File.Exists(cameraWorkerPath))
@@ -3184,7 +3893,7 @@ namespace CameraManager
                 }
 
                 // Start at most 6 camera workers (limit live cameras)
-                int actualCameraCount = Math.Min(6, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count);
+                int actualCameraCount = Math.Min(6, Math.Min(ActiveCameraCount, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam.Count));
                 FileLogger.Log($"?? Starting {actualCameraCount} camera workers");
 
                 // Reset last-frame timestamps so No-Signal can be evaluated from Start
@@ -3237,7 +3946,7 @@ namespace CameraManager
                     }
                 }
 
-                DisplayTimer.Interval = 5;
+                DisplayTimer.Interval = 10;
                 DisplayTimer.Start();
 
                 FileLogger.Log($"? Camera system started with {_supervisors.Count}/{actualCameraCount} workers");
@@ -3368,8 +4077,7 @@ namespace CameraManager
                 }
             }
         }
-
         #endregion
-
     }
 }
+

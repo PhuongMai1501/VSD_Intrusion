@@ -33,7 +33,7 @@ namespace CameraManager
         //CogImage24PlanarColor InputImage = null;
 
         MySqlConnection connection;
-        HttpClient client = new HttpClient();
+        HttpClient client = new HttpClient() { Timeout = TimeSpan.FromSeconds(3.5) };
 
         private Form1 main;
 
@@ -174,14 +174,30 @@ namespace CameraManager
                     var payload = new { image = base64 };
                     var json = JsonConvert.SerializeObject(payload);
                     using var content = new StringContent(json, Encoding.UTF8, "application/json");
-                    var resp = await client.PostAsync(apiUrl, content);
-                    if (!resp.IsSuccessStatusCode)
+                    string respText = null;
+                    try
                     {
-                        toolStripStatus.Text = $"API error: {(int)resp.StatusCode}";
+                        var resp = await client.PostAsync(apiUrl, content);
+                        if (!resp.IsSuccessStatusCode)
+                        {
+                            toolStripStatus.Text = $"API error: {(int)resp.StatusCode}";
+                            original.Dispose();
+                            return;
+                        }
+                        respText = await resp.Content.ReadAsStringAsync();
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        toolStripStatus.Text = "API timeout";
                         original.Dispose();
                         return;
                     }
-                    var respText = await resp.Content.ReadAsStringAsync();
+                    catch (Exception ex)
+                    {
+                        toolStripStatus.Text = $"API exception: {ex.Message}";
+                        original.Dispose();
+                        return;
+                    }
                     var detectionsRaw = JsonConvert.DeserializeObject<List<Detection>>(respText) ?? new List<Detection>();
 
                     // Normalize to original frame [0..1]

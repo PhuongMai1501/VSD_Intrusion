@@ -265,7 +265,7 @@ namespace CameraManager
                     .Select(g => g.First())
                     .ToList();
 
-                using (HttpClient client = new HttpClient())
+                using (HttpClient client = new HttpClient() { Timeout = TimeSpan.FromSeconds(3.5) })
                 {
                     foreach (var r in recipients)
                     {
@@ -289,6 +289,13 @@ namespace CameraManager
                                 $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
                                 ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
                             FileLogger.Log($"Telegram sent to ChatID={r.ChatID} => {(ok ? "OK" : "HTTP_FAIL")}\n");
+                        }
+                        catch (TaskCanceledException tce)
+                        {
+                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
+                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=TIMEOUT ({tce.Message})",
+                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
+                            FileLogger.LogException(tce, $"SendTelegramMessageAsync TIMEOUT -> ChatID={r.ChatID}");
                         }
                         catch (Exception exSend)
                         {
