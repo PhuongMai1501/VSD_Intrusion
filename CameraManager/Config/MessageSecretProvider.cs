@@ -1,0 +1,164 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+namespace CameraManager;
+
+public static class MessageSecretProvider
+{
+    private const string ConfigDirectoryName = "Config Setting";
+    private const string SecretsFileName = "MessageSecrets.ini";
+
+    private const string TelegramPlaceholder = "YOUR_TELEGRAM_BOT_TOKEN";
+    private const string DiscordTokenPlaceholder = "YOUR_DISCORD_BOT_TOKEN";
+    private const string DiscordChannelPlaceholder = "YOUR_DISCORD_CHANNEL_ID";
+
+    private static string BaseDirectory
+    {
+        get
+        {
+            var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrWhiteSpace(baseDir))
+            {
+                return baseDir;
+            }
+
+            // Fall back to current directory only when AppContext does not provide a value
+            return Directory.GetCurrentDirectory();
+        }
+    }
+
+    public static string SecretsDirectory => Path.Combine(BaseDirectory, ConfigDirectoryName);
+    public static string SecretsFilePath => Path.Combine(SecretsDirectory, SecretsFileName);
+
+    public static MessageSecrets GetSecrets()
+    {
+        EnsureSecretsFileExists();
+
+        var data = ParseIniFile(SecretsFilePath);
+
+        var (telegramToken, telegramPlaceholder) = ResolveValue(data, "Telegram.BotToken", TelegramPlaceholder);
+        var (discordToken, discordTokenPlaceholder) = ResolveValue(data, "Discord.BotToken", DiscordTokenPlaceholder);
+        var (discordChannelRaw, discordChannelPlaceholder) = ResolveValue(data, "Discord.ChannelId", DiscordChannelPlaceholder);
+
+        ulong? discordChannelId = null;
+        if (!discordChannelPlaceholder && !string.IsNullOrWhiteSpace(discordChannelRaw))
+        {
+            if (ulong.TryParse(discordChannelRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            {
+                discordChannelId = parsed;
+            }
+        }
+
+        return new MessageSecrets
+        {
+            TelegramBotToken = telegramToken,
+            TelegramBotTokenIsPlaceholder = telegramPlaceholder,
+            DiscordBotToken = discordToken,
+            DiscordBotTokenIsPlaceholder = discordTokenPlaceholder,
+            DiscordChannelId = discordChannelId,
+            DiscordChannelIdIsPlaceholder = discordChannelPlaceholder || (!discordChannelId.HasValue && string.IsNullOrWhiteSpace(discordChannelRaw))
+        };
+    }
+
+    private static void EnsureSecretsFileExists()
+    {
+        if (!Directory.Exists(SecretsDirectory))
+        {
+            Directory.CreateDirectory(SecretsDirectory);
+        }
+
+        if (!File.Exists(SecretsFilePath))
+        {
+            var template = BuildTemplate();
+            File.WriteAllText(SecretsFilePath, template, Encoding.UTF8);
+        }
+    }
+
+    private static Dictionary<string, string> ParseIniFile(string filePath)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string currentSection = string.Empty;
+
+        foreach (var rawLine in File.ReadAllLines(filePath))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrEmpty(line) || line.StartsWith("#") || line.StartsWith(";"))
+            {
+                continue;
+            }
+
+            if (line.StartsWith("[") && line.EndsWith("]"))
+            {
+                currentSection = line[1..^1].Trim();
+                continue;
+            }
+
+            var separatorIndex = line.IndexOf('=');
+            if (separatorIndex <= 0)
+            {
+                continue;
+            }
+
+            var key = line[..separatorIndex].Trim();
+            var value = line[(separatorIndex + 1)..].Trim();
+
+            if (!string.IsNullOrEmpty(currentSection))
+            {
+                key = $"{currentSection}.{key}";
+            }
+
+            result[key] = value;
+        }
+
+        return result;
+    }
+
+    private static (string Value, bool IsPlaceholder) ResolveValue(Dictionary<string, string> data, string key, string placeholder)
+    {
+        if (!data.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (string.Empty, true);
+        }
+
+        value = value.Trim();
+        var isPlaceholder = value.Equals(placeholder, StringComparison.OrdinalIgnoreCase);
+        return (value, isPlaceholder);
+    }
+
+    private static string BuildTemplate()
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("# Message delivery secrets");
+        builder.AppendLine("# Replace the placeholder values with the real credentials in your deployment environment.");
+        builder.AppendLine("# This file is generated automatically and stays outside source control.");
+        builder.AppendLine();
+        builder.AppendLine("[Telegram]");
+        builder.AppendLine($"BotToken={TelegramPlaceholder}");
+        builder.AppendLine();
+        builder.AppendLine("[Discord]");
+        builder.AppendLine($"BotToken={DiscordTokenPlaceholder}");
+        builder.AppendLine($"ChannelId={DiscordChannelPlaceholder}");
+        return builder.ToString();
+    }
+}
+
+public sealed class MessageSecrets
+{
+    public string TelegramBotToken { get; init; } = string.Empty;
+    public bool TelegramBotTokenIsPlaceholder { get; init; }
+    public string DiscordBotToken { get; init; } = string.Empty;
+    public bool DiscordBotTokenIsPlaceholder { get; init; }
+    public ulong? DiscordChannelId { get; init; }
+    public bool DiscordChannelIdIsPlaceholder { get; init; }
+
+    public bool HasTelegramConfiguration => !TelegramBotTokenIsPlaceholder && !string.IsNullOrWhiteSpace(TelegramBotToken);
+
+    public bool HasDiscordConfiguration =>
+        !DiscordBotTokenIsPlaceholder &&
+        !string.IsNullOrWhiteSpace(DiscordBotToken) &&
+        DiscordChannelId.HasValue &&
+        !DiscordChannelIdIsPlaceholder;
+}

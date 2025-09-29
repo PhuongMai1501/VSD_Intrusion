@@ -17,10 +17,7 @@ namespace CameraManager
 {
     public partial class FormConfigMessage : Form
     {
-        private DiscordSocketClient _discordClient;
-        private bool _discordReady = false;
-        private string _discordBotToken = "MTM5NzQyNjg5NTQ1MjI0NjAxNg.GB8PVN.Q7exGNICXiQlx2-wQxW0-qKr0y7lzoKCsYYtz4";
-        private ulong _discordChannelId = 653602857060401207; // Replace with your channel ID
+        private DiscordSocketClient? _discordClient;
 
         public FormConfigMessage()
         {
@@ -216,7 +213,14 @@ namespace CameraManager
             {
                 if (string.IsNullOrWhiteSpace(message)) return;
 
-                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                var secrets = MessageSecretProvider.GetSecrets();
+                if (!secrets.HasTelegramConfiguration)
+                {
+                    MessageBox.Show("Vui lòng cấu hình Telegram Bot Token trong Config Setting/MessageSecrets.ini.");
+                    return;
+                }
+
+                string botToken = secrets.TelegramBotToken;
                 // Lấy danh sách người nhận: Name, SDT, ChatID (có thể nhiều ID trong 1 ô)
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
                 string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
@@ -322,12 +326,22 @@ namespace CameraManager
                 return;
             }
 
+            var secrets = MessageSecretProvider.GetSecrets();
+            if (!secrets.HasDiscordConfiguration || secrets.DiscordChannelId == null)
+            {
+                MessageBox.Show("Vui lòng cấu hình Discord Bot Token và ChannelId trong Config Setting/MessageSecrets.ini.");
+                return;
+            }
+
+            string discordBotToken = secrets.DiscordBotToken;
+            ulong discordChannelId = secrets.DiscordChannelId.Value;
+
             // Ensure the Discord client is initialized and connected
             if (_discordClient == null)
             {
                 _discordClient = new DiscordSocketClient();
                 _discordClient.Log += (msg) => { Console.WriteLine(msg); return Task.CompletedTask; };
-                await _discordClient.LoginAsync(TokenType.Bot, _discordBotToken);
+                await _discordClient.LoginAsync(TokenType.Bot, discordBotToken);
                 await _discordClient.StartAsync();
 
                 // Wait for the client to be ready
@@ -340,7 +354,7 @@ namespace CameraManager
                 await tcs.Task;
             }
 
-            var channel = _discordClient.GetChannel(_discordChannelId) as IMessageChannel;
+            var channel = _discordClient.GetChannel(discordChannelId) as IMessageChannel;
             if (channel != null)
             {
                 await channel.SendMessageAsync(message);

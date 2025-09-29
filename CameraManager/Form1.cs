@@ -33,7 +33,7 @@ namespace CameraManager
         // Dynamic camera count based on database (cap at 6 live cameras)
         private int NumCameras => Math.Min(6, Math.Max(1, ClassSystemConfig.Ins.m_ClsCommon.m_ListRtspCam?.Count ?? 6));
         // Optional override for active camera count (null = use NumCameras)
-        private int? _cameraCountOverride = 1; // set to 1 to test single camera display
+        private int? _cameraCountOverride = null; // default to full camera grid (up to 6)
         private int ActiveCameraCount => Math.Max(1, Math.Min(_cameraCountOverride ?? NumCameras, NumCameras));
 
         private readonly List<ProcessSupervisor> _supervisors = new List<ProcessSupervisor>();
@@ -51,8 +51,8 @@ namespace CameraManager
         // Dynamic Layout Variables
         private TableLayoutPanel tableLayoutPanelCamera;
         private TableLayoutPanel[] tableLayoutPanelDevice;
-        public int Row = 3; // 3 rows
-        public int Col = 4; // 4 columns per row
+        public int Row = 2; // default rows for 6-camera grid
+        public int Col = 3; // default columns for 6-camera grid
 
         // Fullscreen state tracking
         private bool _isFullscreen = false;
@@ -1713,7 +1713,14 @@ namespace CameraManager
                 //FileLogger.Log("SendAlarmToActiveRecipientsAsync: Temporarily disabled DB access to alarm_mes");
                 //return;
 
-                string botToken = "7918989769:AAEAH2IAU91rJ3pBGGGLhuE2SDm03Q4-TH4";
+                var secrets = MessageSecretProvider.GetSecrets();
+                if (!secrets.HasTelegramConfiguration)
+                {
+                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: Telegram bot token is not configured");
+                    return;
+                }
+
+                string botToken = secrets.TelegramBotToken;
                 var recipients = new List<(string Name, string SDT, string ChatID)>();
 
                 string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;

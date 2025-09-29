@@ -121,6 +121,9 @@ ipch/
 # Visual Studio Trace Files
 *.e2e
 
+# Messaging secrets (environment-specific)
+**/Config Setting/MessageSecrets.ini
+
 # TFS 2012 Local Workspace
 $tf/
 
