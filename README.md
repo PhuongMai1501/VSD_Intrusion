@@ -1,62 +1,56 @@
 # Live Camera Processing System
 
-H? th?ng x? l� 12 camera RTSP ??ng th?i v?i ki?n tr�c ?a ti?n tr�nh ?? ??m b?o hi?u n?ng v� ?n ??nh cao.
+Hệ thống xử lý 6 camera RTSP đồng thời với kiến trúc đa tiến trình nhằm đảm bảo hiệu năng và độ ổn định cao cho giám sát thời gian thực.
 
-## C?u tr�c d? �n
+## Cấu trúc dự án
 
 ### CameraWorker
-- Ti?n tr�nh chuy�n d?ng ?? gi?i m� m?t lu?ng camera RTSP
-- S? d?ng FFmpeg.AutoGen cho vi?c decode video v?i h? tr? t?ng t?c ph?n c?ng (CUDA/QSV/D3D11VA)
-- Ghi d? li?u frame v�o Memory-Mapped File ?? chia s? v?i ti?n tr�nh ch�nh
+- Tiến trình chuyên dụng để giải mã từng luồng camera RTSP
+- Sử dụng FFmpeg.AutoGen với hỗ trợ tăng tốc phần cứng (CUDA / Intel QSV / DirectX)
+- Ghi dữ liệu frame vào Memory-Mapped File để chia sẻ với tiến trình chính
 
-### CameraManager  
-- Giao di?n ch�nh qu?n l� 12 camera
-- S? d?ng LittleForker ?? gi�m s�t v� kh?i ??ng l?i c�c ti?n tr�nh CameraWorker
-- Hi?n th? video t? 12 camera trong layout 4x3
-- T? ??ng kh?i ??ng l?i worker khi g?p s? c?
+### CameraManager
+- Giao diện chính giám sát tối đa 6 camera trong layout 2x3
+- Điều khiển và giám sát trạng thái từng tiến trình CameraWorker qua LittleForker
+- Hiển thị video, lớp phủ (overlay) và cảnh báo theo thời gian thực
+- Tự động khởi động lại worker khi phát hiện sự cố hoặc mất tín hiệu
 
-## Y�u c?u h? th?ng
+## Yêu cầu hệ thống
 
 - .NET 8.0
 - Windows 10/11 (x64)
-- FFmpeg libraries (?� ???c bao g?m trong d? �n)
-- GPU h? tr? CUDA, Intel QSV ho?c DirectX (t�y ch?n, cho t?ng t?c ph?n c?ng)
+- Thư viện FFmpeg (được bao gồm trong dự án)
+- GPU hỗ trợ CUDA, Intel QSV hoặc DirectX (tùy chọn, để tăng tốc giải mã)
 
-## C�ch s? d?ng
+## Hướng dẫn sử dụng
 
-1. **C?u h�nh URL camera**: M? `CameraManager\Form1.cs` v� thay th? c�c URL RTSP trong m?ng `_rtspUrls` b?ng ??a ch? th?c t? c?a camera.
+1. **Cấu hình RTSP**: Cập nhật danh sách camera trong cơ sở dữ liệu hoặc file cấu hình theo môi trường triển khai.
+2. **Thiết lập MessageSecrets**: Tạo/điền giá trị thật cho `Config Setting/MessageSecrets.ini` nằm cạnh file chạy (`bin/<Configuration>/...`). Các khóa Telegram/Discord phải được cung cấp tại đây.
+3. **Build dự án**: Mở solution `LiveCameraProcessing.sln`, chọn cấu hình **x64** rồi build.
+4. **Chạy ứng dụng**: Khởi chạy `CameraManager.exe` để bắt đầu giám sát.
 
-```csharp
-private readonly List<string> _rtspUrls = new List<string>
-{
-    "rtsp://192.168.1.100:554/stream1",
-    "rtsp://192.168.1.101:554/stream1",
-    // ... th�m 10 URL kh�c
-};
-```
+## Tính năng chính
 
-2. **Build d? �n**: Ch?n c?u h�nh **x64** (quan tr?ng cho FFmpeg libraries) v� build solution.
+- **Kiến trúc đa tiến trình**: Mỗi camera có một worker riêng, hạn chế ảnh hưởng lẫn nhau.
+- **Tăng tốc phần cứng**: Hỗ trợ giải mã GPU khi khả dụng, fallback sang phần mềm nếu cần.
+- **Tự phục hồi**: Worker tự khởi động lại khi mất kết nối hoặc treo.
+- **Hiệu năng cao**: Chia sẻ frame qua Memory-Mapped File, giảm chi phí sao chép.
+- **Thông báo sự kiện**: Hỗ trợ gửi Telegram/Discord theo cấu hình bảo mật bên ngoài source.
 
-3. **Ch?y ?ng d?ng**: Kh?i ch?y CameraManager.exe
+## Thông số kỹ thuật tham khảo
 
-## T�nh n?ng ch�nh
-
-- **Ki?n tr�c ?a ti?n tr�nh**: M?i camera ch?y trong ti?n tr�nh ri�ng, tr�nh ?nh h??ng l?n nhau
-- **T?ng t?c ph?n c?ng**: H? tr? CUDA, Intel QSV, DirectX cho decode video
-- **T? ph?c h?i**: T? ??ng kh?i ??ng l?i worker khi g?p l?i
-- **Hi?u n?ng cao**: S? d?ng Memory-Mapped File ?? chia s? d? li?u nhanh ch�ng
-- **?? tr? th?p**: T?i ?u h�a cho ?ng d?ng real-time
-
-## Ghi ch� k? thu?t
-
-- Frame size m?c ??nh: 1920x1080 BGR24
-- Frame rate hi?n th?: ~30 FPS
-- Memory-mapped file size: ~6MB per camera
-- Hardware fallback: T? ??ng chuy?n sang software decoder n?u hardware kh�ng kh? d?ng
+- Kích thước frame mặc định: 1920x1080 (BGR24)
+- Tốc độ hiển thị: ~30 FPS (tùy cấu hình phần cứng)
+- Kích thước Memory-Mapped File: ~6MB cho mỗi camera
+- Cơ chế giám sát No-Signal và khởi động lại sau 7 giây không có khung hình
 
 ## Troubleshooting
 
-1. **L?i FFmpeg DLL**: ??m b?o build d? �n ? mode x64
-2. **Camera kh�ng k?t n?i**: Ki?m tra URL RTSP v� k?t n?i m?ng
-3. **Hi?u n?ng th?p**: Ki?m tra driver GPU v� b?t hardware acceleration
-4. **Memory usage cao**: ?i?u ch?nh s? l??ng camera ho?c resolution
+1. **Thiếu FFmpeg DLL**: Đảm bảo build ở chế độ x64 và thư mục `FFmpeg/bin/x64` nằm cạnh file chạy.
+2. **Không kết nối được camera**: Kiểm tra URL RTSP, firewall và thông tin xác thực.
+3. **Hiệu năng thấp**: Cập nhật driver GPU, bật tăng tốc phần cứng hoặc giảm số camera.
+4. **Telegram/Discord không gửi**: Kiểm tra lại `MessageSecrets.ini`, đảm bảo file đúng thư mục runtime và khóa hợp lệ.
+
+## Giấy phép
+
+Dự án sử dụng nội bộ. Khi phân phối cần đảm bảo tuân thủ giấy phép của các thư viện phụ thuộc (FFmpeg, Discord.Net, MySql.Data, v.v.).
