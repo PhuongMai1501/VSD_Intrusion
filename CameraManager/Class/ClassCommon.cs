@@ -37,7 +37,7 @@ namespace CameraManager
 
         public string m_SavePath { get; set; }
 
-        public int m_iFormatSendMessage = 0; // 0: Telegram, 1: Discord, 2: WhatsApp
+        public int m_iFormatSendMessage = 0; // 0: Telegram, 1: Discord, 2: WhatsApp, 3: Zalo
         public int b_ByPassAlarm = 0;
 
         // USER CONTROL
