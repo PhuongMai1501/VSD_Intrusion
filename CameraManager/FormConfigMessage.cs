@@ -1,18 +1,15 @@
 ﻿using Discord;
 using Discord.WebSocket;
 using MySql.Data.MySqlClient;
-using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using CameraManager.Messaging;
 
 namespace CameraManager
 {
@@ -211,301 +208,39 @@ namespace CameraManager
                 return;
             }
 
-            if (selectedApp == "Telegram")
+            int? formatOverride = selectedApp switch
             {
-                await SendTelegramMessageAsync(message);
-                MessageBox.Show("Đã gửi tin nhắn Telegram!");
+                "Telegram" => 0,
+                "Discord" => 1,
+                "WhatsApp" => 2,
+                "Zalo" => 3,
+                _ => null
+            };
+
+            if (formatOverride == null)
+            {
+                MessageBox.Show("Chức năng gửi cho ứng dụng này chưa được hỗ trợ.");
+                return;
             }
-            else if (selectedApp == "Discord")
+
+            if (formatOverride == 1)
             {
                 await SendDiscordMessageAsync(message);
                 MessageBox.Show("Đã gửi tin nhắn Discord!");
+                return;
             }
-            else if (selectedApp == "Zalo")
+
+            if (formatOverride == 2)
             {
-                await SendZaloMessageAsync(message);
+                MessageBox.Show("WhatsApp hiện chưa được hỗ trợ gửi tin.");
+                return;
             }
-            else
-            {
-                MessageBox.Show("Chức năng gửi cho ứng dụng này chưa được hỗ trợ.");
-            }
-        }
 
-        private async Task SendZaloMessageAsync(string? message)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(message))
-                {
-                    MessageBox.Show("Vui lòng nhập nội dung!");
-                    return;
-                }
-
-                string sanitizedMessage = message.Trim();
-
-                string? connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
-                if (string.IsNullOrWhiteSpace(connStr))
-                {
-                    MessageBox.Show("Không tìm thấy chuỗi kết nối dữ liệu.");
-                    FileLogger.Log("SendZaloMessageAsync: Missing DB connection string");
-                    return;
-                }
-
-                var recipients = new List<(int Id, string Name, string Phone)>();
-                using (var conn = new MySqlConnection(connStr))
-                {
-                    await conn.OpenAsync();
-                    const string sql = "SELECT STT, Name, SDT FROM alarm_mes WHERE IsActive = 1 AND SDT IS NOT NULL AND TRIM(SDT) <> ''";
-                    using (var cmd = new MySqlCommand(sql, conn))
-                    using (var reader = await cmd.ExecuteReaderAsync())
-                    {
-                        while (await reader.ReadAsync())
-                        {
-                            int.TryParse(reader["STT"]?.ToString(), out int id);
-                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
-                            var phone = reader["SDT"]?.ToString()?.Trim();
-                            if (!string.IsNullOrWhiteSpace(phone))
-                            {
-                                recipients.Add((id, name, phone));
-                            }
-                        }
-                    }
-                }
-
-                if (recipients.Count == 0)
-                {
-                    MessageBox.Show("Không có số điện thoại kích hoạt để gửi Zalo!");
-                    FileLogger.Log("SendZaloMessageAsync: No active phone number found");
-                    return;
-                }
-
-                var secrets = MessageSecretProvider.GetSecrets();
-                if (string.IsNullOrWhiteSpace(secrets.EsmsApiKey) || string.IsNullOrWhiteSpace(secrets.EsmsSecretKey))
-                {
-                    MessageBox.Show("Chưa cấu hình ApiKey hoặc SecretKey cho Zalo trong file MessageSecrets.ini.");
-                    FileLogger.Log("SendZaloMessageAsync: Missing eSMS ApiKey/SecretKey");
-                    return;
-                }
-
-                if (string.IsNullOrWhiteSpace(secrets.EsmsOaid) || string.IsNullOrWhiteSpace(secrets.EsmsTemplateId) || string.IsNullOrWhiteSpace(secrets.EsmsBrandName))
-                {
-                    MessageBox.Show("Chưa cấu hình đủ thông tin OAID, TemplateId hoặc Brandname cho Zalo trong file MessageSecrets.ini.");
-                    FileLogger.Log("SendZaloMessageAsync: Missing eSMS OAID/TemplateId/Brandname");
-                    return;
-                }
-
-                string callbackUrl = string.IsNullOrWhiteSpace(secrets.EsmsCallbackUrl)
-                    ? "https://esms.vn/webhook/"
-                    : secrets.EsmsCallbackUrl;
-                string campaignId = string.IsNullOrWhiteSpace(secrets.EsmsCampaignId)
-                    ? "FireSmokeAlert"
-                    : secrets.EsmsCampaignId;
-
-                const string url = "https://rest.esms.vn/MainService.svc/json/MultiChannelMessage/";
-                var sbResult = new StringBuilder();
-
-                string area = "Phong 1";
-                if (string.IsNullOrWhiteSpace(area))
-                {
-                    area = ClassCommon.ProgramName;
-                }
-
-                string severity = sanitizedMessage;
-                string detectionTime = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
-
-                using (var client = new HttpClient())
-                {
-                    foreach (var recipient in recipients
-                        .GroupBy(r => r.Phone)
-                        .Select(g => g.First()))
-                    {
-                        string deptName = string.IsNullOrWhiteSpace(recipient.Name)
-                            ? "Không xác định"
-                            : recipient.Name;
-                        string deptId = recipient.Id > 0 ? recipient.Id.ToString() : "Không xác định";
-
-                        var zaloParams = new[]
-                        {
-                            area,
-                            detectionTime,
-                            severity,
-                            deptName,
-                            deptId
-                        };
-
-                        var payload = new
-                        {
-                            ApiKey = secrets.EsmsApiKey,
-                            SecretKey = secrets.EsmsSecretKey,
-                            Phone = recipient.Phone,
-                            Channels = new[] { "zalo", "sms" },
-                            Data = new object[]
-                            {
-                                new
-                                {
-                                    TempID = secrets.EsmsTemplateId,
-                                    Params = zaloParams,
-                                    OAID = secrets.EsmsOaid,
-                                    campaignid = campaignId,
-                                    CallbackUrl = callbackUrl,
-                                    RequestId = Guid.NewGuid().ToString(),
-                                    Sandbox = "0",
-                                    SendingMode = "1"
-                                },
-                                new
-                                {
-                                    Content = sanitizedMessage,
-                                    IsUnicode = "0",
-                                    SmsType = "2",
-                                    Brandname = secrets.EsmsBrandName,
-                                    CallbackUrl = callbackUrl,
-                                    RequestId = Guid.NewGuid().ToString(),
-                                    Sandbox = "0"
-                                }
-                            }
-                        };
-
-                        string jsonPayload = JsonConvert.SerializeObject(payload);
-                        using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-                        try
-                        {
-                            var response = await client.PostAsync(url, content);
-                            string result = await response.Content.ReadAsStringAsync();
-                            sbResult.AppendLine($"Phone {recipient.Phone}: {(int)response.StatusCode} - {result}");
-                        }
-                        catch (Exception ex)
-                        {
-                            sbResult.AppendLine($"Phone {recipient.Phone}: ERROR - {ex.Message}");
-                            FileLogger.LogException(ex, $"SendZaloMessageAsync -> Phone={recipient.Phone}");
-                        }
-                    }
-                }
-
-                string resultText = sbResult.ToString().Trim();
-                if (resultText.Length == 0)
-                {
-                    resultText = "Không có kết quả trả về.";
-                }
-
-                MessageBox.Show(resultText, "Kết quả gửi Zalo");
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Lỗi khi gửi Zalo: " + ex.Message, "Lỗi");
-                FileLogger.LogException(ex, "SendZaloMessageAsync");
-            }
-        }
-
-        private async Task SendTelegramMessageAsync(string message)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(message)) return;
-
-                var secrets = MessageSecretProvider.GetSecrets();
-                if (!secrets.HasTelegramConfiguration)
-                {
-                    MessageBox.Show("Vui lòng cấu hình Telegram Bot Token trong Config Setting/MessageSecrets.ini.");
-                    return;
-                }
-
-                string botToken = secrets.TelegramBotToken;
-                // Lấy danh sách người nhận: Name, SDT, ChatID (có thể nhiều ID trong 1 ô)
-                var recipients = new List<(string Name, string SDT, string ChatID)>();
-                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
-                if (string.IsNullOrWhiteSpace(connStr))
-                {
-                    FileLogger.Log("SendTelegramMessageAsync: Missing DB connection string");
-                    return;
-                }
-
-                using (var conn = new MySqlConnection(connStr))
-                {
-                    await conn.OpenAsync();
-                    string sql = "SELECT Name, SDT, ChatID FROM alarm_mes WHERE IsActive = 1 AND ChatID IS NOT NULL AND TRIM(ChatID) <> ''";
-                    using (var cmd = new MySqlCommand(sql, conn))
-                    using (var reader = await cmd.ExecuteReaderAsync())
-                    {
-                        while (await reader.ReadAsync())
-                        {
-                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
-                            var sdt = reader["SDT"]?.ToString()?.Trim() ?? string.Empty;
-                            var raw = reader["ChatID"]?.ToString()?.Trim();
-                            if (string.IsNullOrWhiteSpace(raw)) continue;
-
-                            // Hỗ trợ nhiều ChatID trong một ô, phân tách bằng , ; khoảng trắng
-                            var parts = raw
-                                .Split(new[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                                .Select(s => s.Trim())
-                                .Where(s => !string.IsNullOrWhiteSpace(s));
-                            foreach (var id in parts)
-                            {
-                                recipients.Add((name, sdt, id));
-                            }
-                        }
-                    }
-                }
-
-                if (recipients.Count == 0)
-                {
-                    FileLogger.Log("SendTelegramMessageAsync: No ChatID found in alarm_mes");
-                    return;
-                }
-
-                // Loại bỏ trùng lặp theo ChatID + Name + SDT để giữ tương ứng đúng
-                recipients = recipients
-                    .GroupBy(r => (r.ChatID, r.Name, r.SDT))
-                    .Select(g => g.First())
-                    .ToList();
-
-                using (HttpClient client = new HttpClient() { Timeout = TimeSpan.FromSeconds(3.5) })
-                {
-                    foreach (var r in recipients)
-                    {
-                        try
-                        {
-                            // Valid sơ bộ chatID (không chặn username @), chỉ để loại bỏ giá trị vô lý
-                            if (string.IsNullOrWhiteSpace(r.ChatID))
-                            {
-                                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                    $"TELEGRAM SEND | Name={r.Name} | ChatID=<EMPTY> | SDT={r.SDT} | Status=FAIL (empty)",
-                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                                continue;
-                            }
-
-                            string url = $"https://api.telegram.org/bot{botToken}/sendMessage?chat_id={r.ChatID}&text={Uri.EscapeDataString(message)}";
-                            var resp = await client.GetAsync(url);
-                            var ok = resp.IsSuccessStatusCode;
-
-                            // Nếu server trả mã lỗi (ví dụ 400 cho chat_id sai), coi như FAIL nhưng không văng lỗi
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.Log($"Telegram sent to ChatID={r.ChatID} => {(ok ? "OK" : "HTTP_FAIL")}\n");
-                        }
-                        catch (TaskCanceledException tce)
-                        {
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=TIMEOUT ({tce.Message})",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.LogException(tce, $"SendTelegramMessageAsync TIMEOUT -> ChatID={r.ChatID}");
-                        }
-                        catch (Exception exSend)
-                        {
-                            // Ghi log thất bại, nhưng không làm crash chương trình
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=FAIL (EXCEPTION: {exSend.Message})",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.LogException(exSend, $"SendTelegramMessageAsync -> ChatID={r.ChatID}");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                FileLogger.LogException(ex, "SendTelegramMessageAsync");
-            }
+            string content = message ?? string.Empty;
+            string area = ClassCommon.ProgramName;
+            var result = await MessagingDispatcher.SendAsync(content, area, content, formatOverride.Value);
+            string caption = result.Success ? "Gửi thành công" : "Gửi thất bại";
+            MessageBox.Show(result.Summary, caption);
         }
 
         private async Task SendDiscordMessageAsync(string message)

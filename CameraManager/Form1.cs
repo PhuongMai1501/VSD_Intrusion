@@ -21,6 +21,7 @@ using System.Threading;
 using System.IO;
 using CameraManager.Class;
 using System.Diagnostics;
+using CameraManager.Messaging;
 
 namespace CameraManager
 {
@@ -259,7 +260,8 @@ namespace CameraManager
                     // Resend alarm message every 10s while unconfirmed
                     if ((now - st.LastAlarmAt).TotalMilliseconds >= ALARM_MIN_INTERVAL_MS && !string.IsNullOrWhiteSpace(st.Label))
                     {
-                        _ = SendAlarmToActiveRecipientsAsync(st.Label);
+                        string areaLabel = GetCameraAreaLabel(cam);
+                        _ = SendAlarmToActiveRecipientsAsync(st.Label, areaLabel, st.Label);
                         st.LastAlarmAt = now;
                     }
                 }
@@ -1194,7 +1196,8 @@ namespace CameraManager
                         if (!string.IsNullOrWhiteSpace(eventTextRaw) && anyInsideRegion)
                         {
                             // Gửi cảnh báo với nhãn gốc (không đổi hoa)
-                            _ = SendAlarmToActiveRecipientsAsync(eventTextRaw);
+                            string areaLabel = GetCameraAreaLabel(cameraIndex);
+                            _ = SendAlarmToActiveRecipientsAsync(eventTextRaw, areaLabel, eventTextRaw);
                             // Kích hoạt cảnh báo: viền đỏ nhấp nháy + popup confirm
                             try { ActivateCameraAlert(cameraIndex, eventTextRaw); } catch { }
 
@@ -1680,12 +1683,24 @@ namespace CameraManager
             return result;
         }
 
-        // Gửi cảnh báo theo cấu hình (chỉ Telegram hiện tại) tới các ChatID đang IsActive=1
-        private async Task SendAlarmToActiveRecipientsAsync(string message)
+        // Gửi cảnh báo theo cấu hình tới các ChatID đang IsActive=1
+        private async Task SendAlarmToActiveRecipientsAsync(string message, string? area = null, string? severity = null, int? overrideFormat = null)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(message)) return;
+                if (string.IsNullOrWhiteSpace(message) && string.IsNullOrWhiteSpace(severity)) return;
+
+                string sanitizedMessage = (message ?? string.Empty).Trim();
+                string sanitizedSeverity = string.IsNullOrWhiteSpace(severity) ? sanitizedMessage : severity!.Trim();
+                if (string.IsNullOrWhiteSpace(sanitizedSeverity))
+                {
+                    sanitizedSeverity = "Không xác định";
+                }
+                if (string.IsNullOrWhiteSpace(sanitizedMessage))
+                {
+                    sanitizedMessage = sanitizedSeverity;
+                }
+
                 // ByPass: nếu bật (1) thì bỏ qua không gửi
                 if (ClassSystemConfig.Ins?.m_ClsCommon?.b_ByPassAlarm == 1) return;
 
@@ -1706,99 +1721,40 @@ namespace CameraManager
                     return;
                 }
 
-                // 0: Telegram (theo form config)
-                if (ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage != 0) return;
+                int format = overrideFormat ?? ClassSystemConfig.Ins?.m_ClsCommon?.m_iFormatSendMessage ?? 0;
 
-                //// TẠM THỜI BỎ QUA TRUY XUẤT DB alarm_mes (bảng chưa tồn tại) — sẽ bật lại sau
-                //FileLogger.Log("SendAlarmToActiveRecipientsAsync: Temporarily disabled DB access to alarm_mes");
-                //return;
-
-                var secrets = MessageSecretProvider.GetSecrets();
-                if (!secrets.HasTelegramConfiguration)
+                string effectiveArea = !string.IsNullOrWhiteSpace(area)
+                    ? area!.Trim()
+                    : ClassCommon.ProgramName;
+                if (string.IsNullOrWhiteSpace(effectiveArea))
                 {
-                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: Telegram bot token is not configured");
-                    return;
+                    effectiveArea = "CAMERA";
                 }
 
-                string botToken = secrets.TelegramBotToken;
-                var recipients = new List<(string Name, string SDT, string ChatID)>();
-
-                string connStr = ClassSystemConfig.Ins?.m_ClsCommon?.connectionString;
-                if (string.IsNullOrWhiteSpace(connStr))
+                string dispatchMessage = sanitizedMessage;
+                if (format == 3)
                 {
-                    FileLogger.Log("SendAlarmToActiveRecipientsAsync: Missing DB connection string");
-                    return;
-                }
-
-                using (var conn = new MySql.Data.MySqlClient.MySqlConnection(connStr))
-                {
-                    await conn.OpenAsync();
-                    string sql = "SELECT Name, SDT, ChatID FROM alarm_mes WHERE IsActive = 1 AND ChatID IS NOT NULL AND TRIM(ChatID) <> ''";
-                    using (var cmd = new MySql.Data.MySqlClient.MySqlCommand(sql, conn))
-                    using (var reader = await cmd.ExecuteReaderAsync())
+                    dispatchMessage = string.IsNullOrWhiteSpace(sanitizedMessage)
+                        ? $"{sanitizedSeverity} tại {effectiveArea}"
+                        : sanitizedMessage;
+                    if (string.Equals(sanitizedMessage, sanitizedSeverity, StringComparison.OrdinalIgnoreCase))
                     {
-                        while (await reader.ReadAsync())
-                        {
-                            var name = reader["Name"]?.ToString()?.Trim() ?? string.Empty;
-                            var sdt = reader["SDT"]?.ToString()?.Trim() ?? string.Empty;
-                            var raw = reader["ChatID"]?.ToString()?.Trim();
-                            if (string.IsNullOrWhiteSpace(raw)) continue;
-
-                            var parts = raw
-                                .Split(new[] { ',', ';', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                                .Select(s => s.Trim())
-                                .Where(s => !string.IsNullOrWhiteSpace(s));
-                            foreach (var id in parts)
-                            {
-                                recipients.Add((name, sdt, id));
-                            }
-                        }
+                        dispatchMessage = $"{sanitizedSeverity} tại {effectiveArea}";
+                    }
+                    if (string.IsNullOrWhiteSpace(dispatchMessage))
+                    {
+                        dispatchMessage = $"{sanitizedSeverity} tại {effectiveArea}";
                     }
                 }
 
-                if (recipients.Count == 0) return;
-                recipients = recipients
-                    .GroupBy(r => (r.ChatID, r.Name, r.SDT))
-                    .Select(g => g.First())
-                    .ToList();
-
-                using (var client = new HttpClient() { Timeout = TimeSpan.FromSeconds(3.5) })
+                var dispatchResult = await MessagingDispatcher.SendAsync(dispatchMessage, effectiveArea, sanitizedSeverity, format, now);
+                if (!dispatchResult.Success)
                 {
-                    foreach (var r in recipients)
-                    {
-                        try
-                        {
-                            if (string.IsNullOrWhiteSpace(r.ChatID))
-                            {
-                                ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                    $"TELEGRAM SEND | Name={r.Name} | ChatID=<EMPTY> | SDT={r.SDT} | Status=FAIL (empty)",
-                                    ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                                continue;
-                            }
-
-                            string url = $"https://api.telegram.org/bot{botToken}/sendMessage?chat_id={r.ChatID}&text={Uri.EscapeDataString(message)}";
-                            var resp = await client.GetAsync(url);
-                            var ok = resp.IsSuccessStatusCode;
-
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status={(ok ? "SUCCESS" : "FAIL (HTTP)")}",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                        }
-                        catch (TaskCanceledException tce)
-                        {
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=TIMEOUT ({tce.Message})",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.LogException(tce, $"SendAlarmToActiveRecipientsAsync TIMEOUT -> ChatID={r.ChatID}");
-                        }
-                        catch (Exception exSend)
-                        {
-                            ClassSystemConfig.Ins.m_ClsFunc.SaveLog(ClassFunction.SAVING_LOG_TYPE.DATA,
-                                $"TELEGRAM SEND | Name={r.Name} | ChatID={r.ChatID} | SDT={r.SDT} | Status=FAIL (EXCEPTION: {exSend.Message})",
-                                ClassSystemConfig.Ins.m_ClsCommon.IsSaveLog_Local, true);
-                            FileLogger.LogException(exSend, $"SendAlarmToActiveRecipientsAsync -> ChatID={r.ChatID}");
-                        }
-                    }
+                    FileLogger.Log($"SendAlarmToActiveRecipientsAsync: Send failed - {dispatchResult.Summary}");
+                }
+                else
+                {
+                    FileLogger.Log($"SendAlarmToActiveRecipientsAsync: Send success (format={format})");
                 }
             }
             catch (Exception ex)
@@ -2605,6 +2561,16 @@ namespace CameraManager
             {
                 FileLogger.LogException(ex, nameof(ActivateCameraAlert));
             }
+        }
+
+        private static string GetCameraAreaLabel(int cameraIndex)
+        {
+            if (cameraIndex < 0)
+            {
+                return "CAMERA";
+            }
+
+            return $"CAMERA {cameraIndex + 1}";
         }
 
         private void ConfirmCameraAlert(int cameraIndex)
